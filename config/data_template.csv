@@ -1,0 +1,1 @@
+serial,hostname,ip,port,mgmt_ip,model,family,vm_license,sw_version,app_version,threat_version,av_version,wildfire_version,url_version,ha_enabled,ha_mode,ha_state,ha_priority,ha_running_sync,ha_peer_serial,ha_peer_hostname,ha_peer_mgmt_ip,ha_peer_state,ha_peer_model,ha_peer_sw_version,ha_peer_conn_status,last_seen,notes

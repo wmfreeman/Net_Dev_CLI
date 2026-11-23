@@ -1,0 +1,146 @@
+---
+# Run Health Check (Palo Firewall Management option 7): what each check looks at, and when it reports
+# WARN or FAIL. Main Menu > Settings > Health Check Thresholds edits these values and saves each change
+# here straight away, keeping your comments; the copy before each change is health_checks.yaml.bak
+# (Health Check Thresholds > Revert Thresholds). You can also edit this file by hand: it's read again
+# at the start of every health check.
+#
+# Every check has <check>_enabled: true or false.
+# A number threshold of 0 turns that threshold off. warn/fail pairs: WARN at the first, FAIL at the second.
+# A severity setting is warn, fail or off (off leaves that condition out of the report).
+# A list is written [a, b], or [] for none.
+
+# ---- System Info (show system info)
+system_info_enabled: true
+# Uptime under this many hours: a restart nobody planned?
+system_info_uptime_warn_hours: 24
+system_info_uptime_fail_hours: 0
+# The device certificate isn't Valid (cloud services need it)
+system_info_device_certificate: warn
+# A VM-Series firewall has no VM license
+system_info_vm_license: fail
+
+# ---- Chassis LEDs (show system state filter chassis.leds - hardware only)
+chassis_leds_enabled: true
+# An LED that's red or amber, or the alarm LED on
+chassis_leds_not_green: fail
+# LEDs not checked. ha is amber on a passive unit.
+chassis_leds_ignore: [ha]
+
+# ---- Environmentals (show system environmentals - hardware only)
+environment_enabled: true
+# A temperature, fan or power sensor in alarm
+environment_alarm: fail
+# A power supply slot is empty - normal on a single-PSU install
+environment_power_supply_missing: warn
+# A temperature within this many degrees C of its sensor's maximum is a WARN
+environment_temp_margin_warn: 5
+
+# ---- MP Resources (management plane: the CPU 1-minute average, and show system resources)
+mp_resources_enabled: true
+# Percent
+mp_resources_cpu_warn: 70
+mp_resources_cpu_fail: 80
+# Memory used, not counting buffers and cache
+mp_resources_memory_warn: 85
+mp_resources_memory_fail: 90
+mp_resources_swap_warn: 1
+mp_resources_swap_fail: 0
+
+# ---- Dataplane (show running resource-monitor, the last 5 minutes)
+dataplane_enabled: true
+# Percent: CPU is the average of the cores; buffers and descriptors are the highest minute
+dataplane_cpu_warn: 80
+dataplane_cpu_fail: 90
+dataplane_packet_buffer_warn: 50
+dataplane_packet_buffer_fail: 80
+dataplane_packet_descriptor_warn: 50
+dataplane_packet_descriptor_fail: 80
+
+# ---- Sessions (show session info)
+sessions_enabled: true
+# Active sessions as a percent of the maximum
+sessions_used_warn: 80
+sessions_used_fail: 90
+
+# ---- HA (show high-availability all). Also shows the HA pairs.
+ha_enabled: true
+# This unit isn't active or passive (suspended, non-functional...), or both units are active
+ha_state: fail
+# The peer isn't connected
+ha_peer_down: fail
+ha_ha1_down: fail
+ha_ha2_down: warn
+# A configured HA1 or HA2 backup link is down
+ha_backup_link_down: warn
+# The running config isn't synchronized with the peer
+ha_config_sync: warn
+# PAN-OS, content or another version doesn't match the peer's
+ha_version_mismatch: warn
+
+# ---- Interfaces (show interface all)
+interfaces_enabled: true
+# An interface with a zone, IP or virtual router configured whose port is down. Tunnel, loopback,
+# VLAN, HA and management interfaces aren't checked.
+interfaces_down: warn
+# Interfaces not checked, e.g. [ethernet1/8]. A port leaves out its subinterfaces too.
+interfaces_ignore: []
+
+# ---- System Log (high and critical entries)
+system_log_enabled: true
+# How far back to search
+system_log_hours: 24
+# This many entries or more
+system_log_high_warn: 1
+system_log_high_fail: 0
+system_log_critical_warn: 0
+system_log_critical_fail: 1
+# Event IDs not counted (known noise), e.g. [general, auth-fail]
+system_log_exclude_eventids: []
+
+# ---- Log Forwarding (show logging-status: logs reach Panorama, a Log Collector or the logging service)
+log_forwarding_enabled: true
+log_forwarding_not_forwarding: warn
+
+# ---- Panorama (show panorama-status)
+panorama_enabled: true
+# A configured Panorama isn't connected
+panorama_disconnected: fail
+
+# ---- Licenses (request license info - the installed licenses; nothing is fetched)
+licenses_enabled: true
+# Days left. An expired license is always a FAIL; expiry_fail_days 0 = only expired.
+licenses_expiry_warn_days: 30
+licenses_expiry_fail_days: 0
+# Licenses not checked, by feature name
+licenses_ignore: []
+
+# ---- Disk (show system disk-space)
+disk_enabled: true
+# Percent full
+disk_used_warn: 85
+disk_used_fail: 95
+# /opt/panrepo with less than this many GB free (room for a PAN-OS image)
+disk_panrepo_free_fail_gb: 3
+# Partitions not checked. /opt/panlogs runs full by design (the oldest logs are purged).
+disk_ignore: [/opt/panlogs]
+
+# ---- Pending Changes (check pending-changes)
+pending_changes_enabled: true
+pending_changes_uncommitted: warn
+
+# ---- Jobs (show jobs all)
+jobs_enabled: true
+# How far back a failed job counts
+jobs_hours: 24
+jobs_failed: warn
+# A job still running after this many minutes is a WARN
+jobs_running_warn_minutes: 60
+
+# ---- Certificates (the certificates in the firewall's own config, shared and vsys)
+certificates_enabled: true
+# Days left. An expired certificate is always a FAIL; expiry_fail_days 0 = only expired.
+certificates_expiry_warn_days: 30
+certificates_expiry_fail_days: 0
+# Certificates not checked, by name
+certificates_ignore: []

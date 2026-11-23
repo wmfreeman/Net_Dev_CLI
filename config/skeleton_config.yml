@@ -1,0 +1,90 @@
+---
+# Main Menu > Settings > Application Settings edits these values and saves each change here straight
+# away, keeping your comments; the copy before each change is config.yml.bak (Revert Settings).
+
+# Offered as the default at the Target prompt (press Enter to use it). Any of:
+#   one firewall:   fw01.example.lan
+#   a list:         fw01.example.lan, fw02, 10.0.0.1:4443
+#   a file:         C:\Users\me\firewalls.txt   (one firewall per line: IP, hostname, or IP,hostname)
+default_target: ''
+
+# false = skip the certificate check (self-signed management certificates) - prints a warning
+# true  = check each firewall's certificate against the system CA store
+# or the path to a CA bundle (.pem) that signed the management certificates
+verify_ssl: false
+
+# Seconds to wait for keygen to answer. This is the time you have to approve the MFA push.
+keygen_timeout: 90
+# Seconds to wait for any other API call
+request_timeout: 30
+# Seconds to wait for an update check - the firewall has to fetch the list from Palo Alto
+check_timeout: 120
+# Seconds to wait for each download or install job to finish (PAN-OS images can take a while)
+job_timeout: 1800
+# Seconds between keep-alive polls: every authenticated firewall is sent show system info this
+# often, in parallel, so its session stays open and you approve MFA only once. Nothing is logged.
+# Keep it well below the firewall's admin Idle Timeout (Device > Setup > Management >
+# Authentication Settings); raise it for slow links or many firewalls. 0 turns polling off.
+# A poll that fails is never repeated, so a lapsed session can't cause a stream of MFA pushes;
+# a poll that gets no reply pauses polling for that firewall but keeps its session.
+keepalive_interval: 60
+# Minutes with no activity (no answer typed, no request sent - polls don't count) before the tool
+# disconnects (logs out of each firewall, clears the API keys) and returns to the Main Menu.
+# 0 never disconnects.
+app_idle_timeout: 30
+
+# Seconds between status checks while a download or install job runs (1-300)
+job_poll_interval: 10
+
+# PAN-OS download safeguards. Before a download every firewall is checked for running jobs and
+# free space; HA pairs always download one unit at a time, passive first.
+# Most firewalls downloading at once. 0 = no limit.
+max_parallel_downloads: 10
+# Disk use (%) a download may bring /opt/pancfg or /opt/panrepo up to before the firewall is listed
+# and you're asked whether to include it. Every image in the download (base images included) is
+# counted: each lands in /opt/pancfg, then moves to /opt/panrepo. A firewall without the room is
+# always left out. 0 skips the disk check.
+disk_warn_percent: 90
+# Seconds a download or install waits for a job already running on a firewall (from this tool,
+# the web UI or Panorama) to finish, checked every minute. Nothing is sent while a job runs.
+# 0 skips a busy firewall instead of waiting.
+queue_timeout: 1800
+# After this many firewalls fail with a corrupt image, stop responding, or don't answer, no more
+# are started and the tool asks before going on. 0 never stops.
+stop_after_failures: 3
+# Default answer to "how many firewalls to download to first" before each PAN-OS download.
+# 0 = all at once; e.g. 2 tries one HA pair first, then asks before the rest.
+download_test_group: 0
+
+# The local data file: one row per firewall, keyed by serial number. Load and Write Local Data File
+# offer it, and Connect to Device(s) loads it when no devices are known. Start from
+# config\data_template.csv, or let Write Local Data File create it. A row needs only an IP or a
+# hostname; anything else you know is checked against the firewall.
+# A relative path is relative to the tool's (or the EXE's) folder.
+data_file: 'data\devices.csv'
+
+# JumpHosts (bastions) Connect via SSH can go through - manage them under
+# Settings > Application Settings > JumpHosts.
+# On: a JumpHost's proxy_jump (another JumpHost's host name) is followed, so a connection can pass
+# through several. Off: each JumpHost is connected to directly and proxy_jump is ignored.
+jump_host_chaining: true
+# Numbered JumpHosts. The tool writes these to a temporary ssh config file for each ssh run, e.g.
+#   1:
+#     host: bastion                 # the name (ssh Host); proxy_jump refers to it
+#     hostname: bastion.example.com
+#     user: admin
+#     port: 22
+#     identity_file: ~/.ssh/id_ed25519_bastion
+#     identities_only: true
+#     proxy_jump: ''                # another JumpHost's host, or '' to connect directly
+jump_hosts: {}
+
+# Where config snapshots and system state backups are saved. Environment variables such as
+# %USERPROFILE% are expanded; a relative path is relative to the tool's (or the EXE's) folder.
+download_folder: '%USERPROFILE%\Downloads'
+
+# Every run writes everything shown on screen, and every answer typed (never the password),
+# to <log_folder>\<date>_<time>.log. Relative paths are relative to the tool's folder.
+log_folder: logs
+# Logs older than this many days are deleted at start-up. 0 keeps them all.
+log_retention_days: 30
