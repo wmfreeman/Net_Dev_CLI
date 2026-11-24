@@ -514,14 +514,16 @@ Both install options then show a plan for each firewall and ask for a confirmati
 | Skip - up to date / already installed | Nothing to do |
 | Skip - update check failed | The check failed on that firewall, so there's no release list to install from |
 | Skip - this firewall does not list that version | Advanced Installation only |
+| Skip - the firewall didn't list a file name to download | The update check gave no file name for a version that isn't downloaded yet |
 
 The steps run on all the firewalls at once. Within one firewall they run in order (Apps & Threats before Antivirus, which needs a recent Apps & Threats version), and a failed step stops that firewall's later steps. Each download and install is a firewall job; the tool polls it every 10 seconds and prints its progress, up to `job_timeout` seconds (default 1800). A results table follows. Ctrl+C stops watching: jobs already started carry on on the firewall, and steps that hadn't started aren't sent.
 
 | Content | Download | Install |
 |---------|----------|---------|
-| Apps & Threats, Antivirus, WildFire (current) | `<download><latest></latest></download>` | `<install><version>latest</version></install>` |
-| Apps & Threats, Antivirus, WildFire (specific) | `<download><file>{filename}</file></download>` | `<install><version>{version}</version></install>` |
+| Apps & Threats, Antivirus, WildFire | `<download><file>{filename}</file></download>` | `<install><version>{version}</version></install>` |
 | GP Client | `<download><version>{version}</version></download>` | `<activate><version>{version}</version></activate>` |
+
+Both install options name the file and version the update check listed, never `latest`. A release published after the check (WildFire's come every few minutes) isn't picked up instead, so what's installed is what the plan showed, and what the results table and CSV say.
 
 With new apps disabled, Apps & Threats installs add the `<disable-new-content></disable-new-content>` flag inside `<install>`, before `<version>`. With new apps enabled, the flag is left out.
 

@@ -3202,11 +3202,12 @@ def current_release(releases):
 
 # ---------------------------------------------------------------- content installs
 
-def content_steps(content, release, latest=False, disable_new_apps=False):
+def content_steps(content, release, disable_new_apps=False):
     """Download (unless already downloaded) and install steps for one content release.
 
-    latest uses the 'latest' keyword, as Palo Alto's API docs do for installing the newest
-    release; otherwise the release is named. GP Client packages are downloaded and activated by version.
+    The release is named - its file and version, as the update check listed them - never 'latest',
+    which could pick a release published since the check (WildFire's come every few minutes): what's
+    installed is what the plan showed. GP Client packages are downloaded and activated by version.
     disable_new_apps sets 'Disable new apps in content update' on an Apps & Threats install.
     """
     outer, inner = CONTENT_TYPES[content][0]
@@ -3215,9 +3216,6 @@ def content_steps(content, release, latest=False, disable_new_apps=False):
     if content == 'GP Client':
         download = f"<download><version>{version}</version></download>"
         install = f"<activate><version>{version}</version></activate>"
-    elif latest:
-        download = '<download><latest></latest></download>'
-        install = f"<install>{options}<version>latest</version></install>"
     else:
         download = f"<download><file>{release.get('filename', '')}</file></download>"
         install = f"<install>{options}<version>{version}</version></install>"
@@ -3234,6 +3232,12 @@ def content_steps(content, release, latest=False, disable_new_apps=False):
 
 def step_text(release):
     return 'Download + install' if release.get('downloaded') != 'yes' else 'Install (already downloaded)'
+
+
+def no_file_to_download(content, release):
+    """Whether a release still has to be downloaded, but the update check gave no file name for it
+    (GP Client packages are downloaded by version, so they never need one)."""
+    return content != 'GP Client' and release.get('downloaded') != 'yes' and not release.get('filename')
 
 
 def new_apps_text(disable_new_apps):
@@ -3268,6 +3272,8 @@ def install_current(firewalls, contents):
                 row['Action'] = 'Skip - update check failed'
             elif releases[0].get('current') == 'yes':
                 row['Action'] = 'Skip - up to date'
+            elif no_file_to_download(content, releases[0]):
+                row['Action'] = "Skip - the firewall didn't list a file name to download"
             else:
                 candidates.append((content, fw, row, releases[0]))
                 row['Install'] = releases[0]['version']
@@ -3301,7 +3307,7 @@ def install_current(firewalls, contents):
 
     plans = {}
     for content, fw, row, release in candidates:
-        plans.setdefault(fw, []).extend(content_steps(content, release, True, disable_new_apps))
+        plans.setdefault(fw, []).extend(content_steps(content, release, disable_new_apps))
         if content == 'Apps & Threats':
             row['Action'] += f" - {new_apps_text(disable_new_apps)}"
     return run_plan(rows, plans, 'Install', firewalls)
@@ -3352,8 +3358,7 @@ def advanced_install(firewalls, contents):
             row['Action'] = 'Skip - this firewall does not list that version'
         elif release.get('current') == 'yes':
             row['Action'] = 'Skip - already installed'
-        elif (content != 'GP Client' and release.get('downloaded') != 'yes'
-              and not release.get('filename')):
+        elif no_file_to_download(content, release):
             row['Action'] = "Skip - the firewall didn't list a file name to download"
         else:
             plans[fw] = content_steps(content, release, disable_new_apps=disable_new_apps)
