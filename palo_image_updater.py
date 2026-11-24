@@ -622,6 +622,11 @@ SETTING_CATEGORIES = {
         Setting('app_idle_timeout', 'number', APP_IDLE_TIMEOUT,
                 "Minutes with no activity before the tool logs out, clears the API keys and returns to the Main Menu. "
                 "0 never disconnects.", 0),
+        Setting('logout_on_disconnect', 'onoff', True,
+                "On: Disconnect (also Exit, Ctrl+C, the idle timeout, an error, closing the window) logs out of each "
+                "firewall with delete admin-sessions, which ends every CLI and API session that admin has on it - "
+                "your other SSH sessions too, and anyone else's on the same account. Off: the keys and the password "
+                "are only cleared from memory, and each session ends at the firewall's own idle timeout."),
     ],
     'Jobs & Downloads': [
         Setting('job_timeout', 'number', 1800,
@@ -681,6 +686,8 @@ def load_config():
                                                 setting.high, setting.zero_means_default)
         elif setting.kind == 'path':
             config[setting.key] = str(config.get(setting.key) or setting.default)
+        elif setting.kind == 'onoff' and setting is not JUMP_CHAINING:
+            config[setting.key] = setting.read(config, CONFIG_PATH.name)
     chaining = config.get(JUMP_CHAINING.key)
     config[JUMP_CHAINING.key] = (JUMP_CHAINING.default if chaining is None
                                  else str(chaining).lower() in ON_WORDS)
@@ -5756,6 +5763,9 @@ class Connection:
         self.firewalls = []
         self.keepalive = None
         self.lock = threading.Lock()
+        # The run's config (the same dict Settings changes), so Disconnect reads logout_on_disconnect
+        # as it is when it runs
+        self.config = None
 
     @property
     def connected(self):
@@ -5789,14 +5799,18 @@ def disconnect(reason, timeout=None, wait=None, quiet=False):
     if keepalive:
         keepalive.stop()
     holding = [fw for fw in firewalls if fw.authenticated]
-    if holding:
+    logout = (CONNECTION.config or {}).get('logout_on_disconnect', True)
+    outcomes = {}
+    if holding and logout:
         with contextlib.suppress(OSError):
             say(f"\nDisconnecting ({reason}) - logging out of {len(holding)} firewall(s)...")
         with ThreadPoolExecutor(max_workers=min(len(holding), LOGOUT_PARALLEL)) as pool:
             futures = {fw: pool.submit(fw.logout, timeout, wait) for fw in holding}
         outcomes = {fw: future.exception() for fw, future in futures.items()}
-    else:
-        outcomes = {}
+    elif holding:
+        with contextlib.suppress(OSError):
+            say(f"\nDisconnecting ({reason}) - logout_on_disconnect is off, so {len(holding)} firewall(s) aren't "
+                f"logged out; their keys are cleared.")
     CREDENTIALS.clear()
     for fw in firewalls:
         fw.close()
@@ -5809,6 +5823,9 @@ def disconnect(reason, timeout=None, wait=None, quiet=False):
             else:
                 text = connection_error_text(error) if isinstance(error, requests.RequestException) else str(error)
                 result, detail = FAIL, f"{text} - the session ends at the firewall's idle timeout"
+        elif fw in holding:
+            result, detail = 'Key cleared', ("not logged out (logout_on_disconnect is off) - the session ends at "
+                                             "the firewall's idle timeout")
         elif fw.username:
             result, detail = '-', f"no key held ({fw.auth_reason or 'session already ended'})"
         else:
@@ -5831,6 +5848,7 @@ def connect(config):
     """Main Menu option 1: pick firewalls and authenticate them, then back to the Main Menu (Manage
     Devices opens their menu). Firewalls already connected stay connected and the new ones join
     them; one already in the session isn't added twice (one without a key is authenticated again)."""
+    CONNECTION.config = config
     targets = choose_targets(config)
     if not targets:
         return

@@ -107,6 +107,7 @@ Main Menu option 3, shown while firewalls are connected. Logs out of every conne
 - **The logout:** the keep-alive is stopped first, so no poll can log you back in. Then each firewall that holds a key gets `<delete><admin-sessions><username>{your username}</username></admin-sessions></delete>`, all at once. PAN-OS has no logout for a single API session, so the command targets every session that admin has on the firewall. In testing, a web UI session for the same admin stayed logged in.
 - **The report:** one row per firewall. `Logged out` means the firewall confirmed it, or ended the session the request arrived on. `FAIL` gives the reason (no reply, refused, no permission for the command), and that session then ends at the firewall's own admin idle timeout. A firewall whose session had already ended is listed with `-`. One that never authenticated isn't listed.
 - **The key is cleared either way**, whatever the firewall answers.
+- **The logout is optional:** `logout_on_disconnect` (Settings > Application Settings > Connection, default On). Because the logout ends every CLI and API session that admin has on the firewall, turn it Off if you share an admin account, or keep other SSH sessions open with the same account. Off, Disconnect only clears the keys and the password, each firewall is listed as `Key cleared`, and its session ends at the firewall's own idle timeout.
 
 The same Disconnect runs, with the same report, when you:
 
@@ -906,6 +907,7 @@ At start-up, logs and results files older than `log_retention_days` are deleted.
 | `job_poll_interval` | `10` | Seconds between job status checks |
 | `keepalive_interval` | `60` | Seconds between keep-alive polls of every authenticated firewall; `0` turns polling off |
 | `app_idle_timeout` | `30` | Minutes with no activity before the tool disconnects (logs out and clears the keys) and returns to the Main Menu; `0` never disconnects |
+| `logout_on_disconnect` | `true` | Disconnect logs out of each firewall (`delete admin-sessions`, ending every CLI and API session that admin has there); `false` only clears the keys and the password (see [Disconnect](#disconnect)) |
 | `download_folder` | `%USERPROFILE%\Downloads` | Where snapshots, system state backups and log search CSVs are saved |
 | `log_folder` | `logs` | Where run logs are written |
 | `log_retention_days` | `30` | Logs older than this are deleted at start-up; `0` keeps them all |
