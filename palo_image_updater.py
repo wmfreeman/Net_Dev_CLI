@@ -1226,12 +1226,14 @@ def read_data_rows(path):
     the tool doesn't know keep their own name. Returns (rows, header)."""
     import csv
     with open(path, newline='', encoding='utf-8-sig') as f:
-        lines = [line for line in f if line.strip() and not line.lstrip().startswith('#')]
-    reader = csv.reader(lines)
-    header = next(reader, [])
+        # Parsed as CSV first, so a quoted cell can hold several lines (Alt+Enter in Excel) - blank ones
+        # and ones starting with # included. Only then are blank rows and # comment rows left out.
+        records = [values for values in csv.reader(f)
+                   if any(value.strip() for value in values) and not values[0].lstrip().startswith('#')]
+    header = records[0] if records else []
     names = [data_column(h) or h.strip() for h in header]
     rows = []
-    for values in reader:
+    for values in records[1:]:
         row = {}
         for name, value in zip(names, values):
             value = value.strip()
