@@ -37,7 +37,7 @@ CONFIG_PATH = BASE_DIR / 'config' / 'config.yml'
 SKELETON_PATH = BUNDLE_DIR / 'config' / 'skeleton_config.yml'
 
 APP_TITLE = 'Net_Dev_CLI'
-REPO_URL = 'https://github.com/wmfreeman/palo-toolkit'
+REPO_URL = 'https://github.com/wmfreeman/Net_Dev_CLI'
 GIT_TIMEOUT = 60
 # A change to either means the dependencies need reinstalling after an update
 DEPENDENCY_FILES = ('pyproject.toml', 'poetry.lock')
@@ -51,7 +51,7 @@ SSH_VERSION = re.compile(r'OpenSSH\w*?_(\d+)\.(\d+)')
 SSH_ASKPASS_VERSION = (8, 4)
 # Set only in ssh's environment: tells this tool, started again by ssh to answer a prompt, where to
 # fetch the password (AskpassServer)
-ASKPASS_ENV = 'PALO_UPDATER_ASKPASS'
+ASKPASS_ENV = 'NET_DEV_CLI_ASKPASS'
 # ssh prompts: a password (filled in once) and a yes/no question (the host key; typed, with echo)
 SSH_PASSWORD_PROMPT = re.compile(r'password', re.IGNORECASE)
 SSH_CONFIRM_PROMPT = re.compile(r'\(yes/no', re.IGNORECASE)
@@ -5266,7 +5266,7 @@ class AskpassServer:
         # so a JumpHost's prompts never get it
         self.target = target
         self.key = secrets.token_bytes(32)
-        self.address = rf"\\.\pipe\palo-updater-askpass-{secrets.token_hex(16)}"
+        self.address = rf"\\.\pipe\net-dev-cli-askpass-{secrets.token_hex(16)}"
         self.listener = Listener(self.address, family='AF_PIPE', authkey=self.key)
         self.done = threading.Event()
         self.served = False
@@ -6193,7 +6193,7 @@ def ssh_config_file(config, batch=False):
     deletes it afterwards. It holds no passwords. ssh hands the path on to each JumpHost connection
     without quotes, so it has to have no spaces (ValueError otherwise)."""
     import tempfile
-    folder = Path(tempfile.mkdtemp(prefix='palo-ssh-'))
+    folder = Path(tempfile.mkdtemp(prefix='net-dev-cli-ssh-'))
     try:
         path = folder / 'ssh_config'
         path.write_text(ssh_config_text(config, batch), encoding='utf-8')
@@ -6516,8 +6516,10 @@ def check_tool_updates():
         print(f"This copy wasn't installed with git clone, so it can't update itself.\n"
               f"Get the latest version from {REPO_URL}")
         return
-    print(f"Checking {REPO_URL}...")
     try:
+        # The repo this clone actually fetches from, shown without any credentials in its URL
+        remote = re.sub(r'//[^/@]*@', '//', git('ls-remote', '--get-url').stdout.strip())
+        print(f"Checking {remote or 'the remote repo'}...")
         fetch = git('fetch', '--quiet')
         if fetch.returncode:
             print(f"Could not reach the repo: {fetch.stderr.strip()}")

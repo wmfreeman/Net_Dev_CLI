@@ -13,8 +13,8 @@ Checks the PAN-OS version and dynamic content (Apps & Threats, Antivirus, WildFi
 ## Installation
 
 ```powershell
-git clone https://github.com/wmfreeman/palo-toolkit.git
-cd palo-toolkit
+git clone https://github.com/wmfreeman/Net_Dev_CLI.git
+cd Net_Dev_CLI
 poetry lock
 poetry install
 ```
@@ -76,7 +76,7 @@ The Main Menu is the application level: connecting, the local data file, setting
 | 5 - Write Local Data File | Asks which data file to write (Enter takes the current one), then creates it or updates it with the device database (see [Local data file](#local-data-file)) |
 | 6 - View Devices | Lists the known devices, numbered. Only shown once the device database holds some: after loading a data file, or after connecting. |
 | 7 - Settings | Application Settings (every `config.yml` setting, by category, plus the JumpHosts for Connect via SSH) and Health Check Thresholds (`health_checks.yaml`). Each change is saved straight away (see [Settings](#settings)). |
-| 8 - Check for Tool Updates | Checks the repo it was cloned from ([GitHub](https://github.com/wmfreeman/palo-toolkit)) for a newer version of this tool (see below) |
+| 8 - Check for Tool Updates | Checks the repo it was cloned from ([GitHub](https://github.com/wmfreeman/Net_Dev_CLI)) for a newer version of this tool (see below) |
 | 0 - Exit | [Disconnects](#disconnect) any firewalls still connected, with the same report as option 3, then exits |
 
 **Staying connected.** After connecting, and after `0` in Palo Firewall Management, you're back here, still connected: the API keys, the password and the keep-alive carry on, and the [application idle timeout](#session-timeouts-and-the-keep-alive) still applies. Manage Devices opens Palo Firewall Management for them. Connect to Device(s) while connected adds firewalls to the session: they're numbered on from the ones already connected, only the new ones are authenticated (with their MFA pushes), and a firewall already connected isn't added twice (one that has lost its key is authenticated again). The authentication table is then shown for the whole session.
@@ -98,7 +98,7 @@ They're in hostname order (or IP, for a device with no hostname yet), so a devic
 
 **Check for Tool Updates** runs `git fetch` and lists any new commits on the branch you're on, with their dates. It then asks before applying them with `git pull --ff-only`. That only fast-forwards, so it never overwrites local edits or merges over local commits; if there are any, it says so and changes nothing. After an update, exit and start the tool again. If `pyproject.toml` or `poetry.lock` changed, run `poetry install` first.
 
-It uses your normal git credentials (Git Credential Manager on Windows) and never prompts in the terminal. It needs `git` on PATH, and a copy installed with `git clone`.
+It uses your normal git credentials (Git Credential Manager on Windows) and never prompts in the terminal. It needs `git` on PATH, and a copy installed with `git clone`. It names the repo it checks: the one your copy was cloned from. A copy cloned from the retired `palo-toolkit` repo gets no more updates; point it here once with `git remote set-url origin https://github.com/wmfreeman/Net_Dev_CLI.git`.
 
 ### Disconnect
 
@@ -940,7 +940,7 @@ The seconds shown next to each result help tell these apart. `Monitor > Logs > S
 ## Project Structure
 
 ```text
-palo-toolkit/
+Net_Dev_CLI/
 ├── config/
 │   ├── config.yml              # Your configuration (not in repo)
 │   ├── config.yml.bak          # The copy before the last Settings change (not in repo)
