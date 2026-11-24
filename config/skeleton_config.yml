@@ -8,7 +8,8 @@
 #   a file:         C:\Users\me\firewalls.txt   (one firewall per line: IP, hostname, or IP,hostname)
 default_target: ''
 
-# false = skip the certificate check (self-signed management certificates) - prints a warning
+# false = no CA check (self-signed management certificates). Each firewall's certificate is
+#         trusted the first time it connects and has to match every time after (known_certs.txt)
 # true  = check each firewall's certificate against the system CA store
 # or the path to a CA bundle (.pem) that signed the management certificates
 verify_ssl: false

@@ -40,7 +40,7 @@ The script runs `poetry install`, which includes PyInstaller as a dev dependency
 
 `config/config.yml` is created from `config/skeleton_config.yml` on first run, and `config/health_checks.yaml` (the [health check thresholds](#health-check-thresholds)) from `config/skeleton_health_checks.yaml` the first time it's needed. Change them from [Settings](#settings) (Main Menu option 7), or by editing them. Set `default_target` to the firewalls you usually check (any form the Target prompt accepts), or leave it blank. Once the [local data file](#local-data-file) holds devices, those are the default instead.
 
-Certificate checking is off by default (`verify_ssl: false`) because firewall management interfaces use self-signed certificates. Set it to `true`, or to the path of a CA bundle, if yours are signed by a CA you trust.
+By default (`verify_ssl: false`) certificates aren't checked against a CA, because firewall management interfaces use self-signed certificates. Instead, each firewall's certificate is trusted the first time you connect to it and pinned: every connection after that has to present the same one, or nothing is sent (see [Certificates](#certificates)). Set `verify_ssl` to `true`, or to the path of a CA bundle, if your certificates are signed by a CA you trust.
 
 ## Usage
 
@@ -331,6 +331,8 @@ They also appear at the bottom of the action's results table as `SKIPPED` with t
 
 ### Authentication
 
+With `verify_ssl: false` (the default), each firewall's [certificate](#certificates) is checked first, before the tool asks for anything.
+
 1. The tool asks for your username and password once.
 2. For each selected firewall in turn, it generates an API key and then makes one call with it to confirm the key works. Approve each MFA push within `keygen_timeout` seconds.
 3. A firewall only passes once its key has been accepted. The stage prints PASS or FAIL as it goes, including how long the keygen and the first use took.
@@ -356,6 +358,16 @@ HA: 1 pair(s) in the list; peer not in the list for #4
 **HA Peer** shows the peer's number and hostname when it's in the list, with `(not authenticated)` if its login failed. A peer that isn't in the list is shown by the management IP its partner reports, with its hostname if the device database knows that serial number. **Notes** holds the reason a firewall failed, or what to check on one that passed. The model and PAN-OS version shown are as read at login. After [Retry Authentication](#9---retry-authentication), the table is shown again for the whole list, so retried peers pair up.
 
 Every MFA push happens in this stage, so listing, checking and later actions never stop to wait for one. On some setups, PAN-OS logs a remote (RADIUS) admin in again the first time a new key is used, which sends a second push. If it does and you ignore it, the firewall fails with "rejected on first use", and you can retry it with [Retry Authentication](#9---retry-authentication).
+
+#### Certificates
+
+Management interfaces use self-signed certificates, so with `verify_ssl: false` the tool can't check them against a CA. Instead it trusts each firewall's certificate the first time you connect to it, and pins it, the way ssh treats host keys:
+
+- **First connection:** before the password is asked for, each firewall the tool hasn't seen is listed with its certificate's SHA-256 fingerprint. One question trusts them all. Check a fingerprint against the one your browser shows for the firewall's web UI if you can. Trusted fingerprints are kept in `config\known_certs.txt`, one `<address>:<port> <sha256>` per line. If you answer no, those firewalls are `SKIPPED` and get nothing.
+- **Every connection after that** has to present the same certificate. This includes keep-alive polls, actions and Disconnect, directly or through a proxy. It's checked during the TLS handshake, before anything (the credentials included) is sent.
+- **A changed certificate is refused:** the firewall fails with `its certificate has CHANGED since it was trusted - possible interception, nothing sent`, and both fingerprints are shown. If it was replaced on purpose (a renewed certificate, or a replacement firewall at that address), delete its line in `known_certs.txt` and connect again.
+- **Not read:** a firewall whose certificate can't be read (no answer, refused) fails before anything is sent.
+- A firewall reached at a different address (its hostname instead of its IP, say) is a separate entry, trusted the first time too. With `verify_ssl: true` or a CA bundle, certificates are checked against the CA instead and nothing is pinned.
 
 #### Session timeouts and the keep-alive
 
@@ -857,7 +869,7 @@ Antivirus and WildFire files aren't offered for deletion, because those use sepa
 - The password is read with `getpass`. Once a firewall accepts it, it's kept in memory for [Connect via SSH](#8---connect-via-ssh) until you [disconnect](#disconnect) (Disconnect, Exit, Ctrl+C, or the idle timeout). Going back to the Main Menu keeps it. If no firewall accepts it, it's dropped straight away. Retrying asks for it again.
 - Credentials go in the POST body, never in a URL.
 - API keys are held only in memory. Disconnect logs each one's admin session out on the firewall and clears them, and it also runs when you exit (including Ctrl+C and closing the window).
-- Nothing is written to disk except `config/config.yml` and `config.yml.bak`, which hold no secrets (JumpHosts name a key file, never a key or password), the temporary ssh config written for a JumpHost session (deleted when it ends), the [run logs](#run-logs), the [local data file](#local-data-file) when you write it (firewall details only, never credentials or keys), and the config snapshots and system state backups you download. Those downloads are the firewall's full configuration, including password hashes and encrypted keys, so keep them safe.
+- Nothing is written to disk except `config/config.yml` and `config.yml.bak`, which hold no secrets (JumpHosts name a key file, never a key or password), `config/known_certs.txt` (certificate fingerprints, no secrets), the temporary ssh config written for a JumpHost session (deleted when it ends), the [run logs](#run-logs), the [local data file](#local-data-file) when you write it (firewall details only, never credentials or keys), and the config snapshots and system state backups you download. Those downloads are the firewall's full configuration, including password hashes and encrypted keys, so keep them safe.
 - The run logs record the username and every answer you type, but never the password (it's read with `getpass`, which bypasses the log) or the API keys.
 
 ## Run logs
@@ -884,7 +896,7 @@ At start-up, logs and results files older than `log_retention_days` are deleted.
 | Option | Default | What it does |
 |--------|---------|--------------|
 | `default_target` | `''` | Offered at the Target prompt when no devices are known: one firewall, a list, or a file path |
-| `verify_ssl` | `false` | Certificate checking: `false`, `true`, or the path to a CA bundle |
+| `verify_ssl` | `false` | Certificate checking: `false` (each firewall's certificate trusted on first use and pinned in `known_certs.txt`, see [Certificates](#certificates)), `true`, or the path to a CA bundle |
 | `keygen_timeout` | `90` | Seconds to approve the MFA push |
 | `request_timeout` | `30` | Seconds to wait for any other API call, and for ssh to connect to a JumpHost |
 | `check_timeout` | `120` | Seconds to wait for an update check, a snapshot, a system state export, a log search or a JumpHost test |
@@ -947,6 +959,7 @@ Net_Dev_CLI/
 │   ├── data_template.csv       # Empty data file with every column
 │   ├── health_checks.yaml      # Your health check thresholds (not in repo)
 │   ├── health_checks.yaml.bak  # The copy before the last threshold change (not in repo)
+│   ├── known_certs.txt         # Certificates trusted on first use, verify_ssl: false (not in repo)
 │   ├── skeleton_config.yml     # Configuration template
 │   └── skeleton_health_checks.yaml  # Health check thresholds template
 ├── data/

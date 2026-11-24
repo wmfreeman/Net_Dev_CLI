@@ -6,6 +6,7 @@ Credentials and API keys are held in memory for this run only and never written 
 """
 import contextlib
 import getpass
+import hashlib
 import ipaddress
 import os
 import re
@@ -13,6 +14,7 @@ import secrets
 import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import textwrap
@@ -35,6 +37,8 @@ BASE_DIR = Path(sys.executable if FROZEN else __file__).resolve().parent
 BUNDLE_DIR = Path(getattr(sys, '_MEIPASS', BASE_DIR))
 CONFIG_PATH = BASE_DIR / 'config' / 'config.yml'
 SKELETON_PATH = BUNDLE_DIR / 'config' / 'skeleton_config.yml'
+# verify_ssl false: each firewall's certificate, trusted the first time it connects (check_certificates)
+CERTS_PATH = BASE_DIR / 'config' / 'known_certs.txt'
 
 APP_TITLE = 'Net_Dev_CLI'
 REPO_URL = 'https://github.com/wmfreeman/Net_Dev_CLI'
@@ -598,8 +602,10 @@ SETTING_CATEGORIES = {
     ],
     'Connection': [
         Setting('verify_ssl', 'ssl', False,
-                "false skips the certificate check (self-signed management certificates); true checks each "
-                "firewall's certificate against the system CA store; or the path to a CA bundle (.pem)."),
+                "false: no CA check (self-signed management certificates) - each firewall's certificate is "
+                "trusted the first time it connects and has to match every time after (known_certs.txt); "
+                "true checks each firewall's certificate against the system CA store; or the path to a CA "
+                "bundle (.pem)."),
         Setting('keygen_timeout', 'number', 90,
                 "Seconds to wait for keygen to answer - the time you have to approve the MFA push.",
                 10, zero_means_default=True),
@@ -1539,6 +1545,25 @@ def parse_response(response):
     return root
 
 
+class PinnedAdapter(requests.adapters.HTTPAdapter):
+    """Accepts only the one certificate whose SHA-256 is fingerprint. urllib3 checks it during the TLS
+    handshake of every connection - direct or through a proxy - before the request (credentials
+    included) is sent, so a different certificate gets nothing."""
+
+    def __init__(self, fingerprint, **kwargs):
+        # Set first: HTTPAdapter.__init__ calls init_poolmanager
+        self.fingerprint = fingerprint
+        super().__init__(**kwargs)
+
+    def init_poolmanager(self, *args, **kwargs):
+        kwargs['assert_fingerprint'] = self.fingerprint
+        super().init_poolmanager(*args, **kwargs)
+
+    def proxy_manager_for(self, proxy, **proxy_kwargs):
+        proxy_kwargs['assert_fingerprint'] = self.fingerprint
+        return super().proxy_manager_for(proxy, **proxy_kwargs)
+
+
 class Firewall:
     """One firewall's XML API session. Its API key lives only in this object's headers."""
 
@@ -1573,6 +1598,10 @@ class Firewall:
         self.session.verify = config['verify_ssl']
         # Exactly one attempt per call: a retried keygen would send another MFA push
         self.session.mount('https://', requests.adapters.HTTPAdapter(max_retries=0))
+        # With verify_ssl false, nothing is sent until the firewall's certificate is pinned
+        # (check_certificates, pin): its SHA-256, checked on every connection after that
+        self.needs_pin = config['verify_ssl'] is False
+        self.fingerprint = None
         self.auth_result = None
         self.auth_reason = ''
         # The admin whose key this is: Disconnect logs that admin's sessions out (logout)
@@ -1621,6 +1650,7 @@ class Firewall:
         return 'X-PAN-KEY' in self.session.headers
 
     def keygen(self, username, password):
+        self.check_pinned()
         with self.lock:
             self.forget_key()
             # Credentials go in the POST body so they never land in a URL, proxy log or access log.
@@ -1644,6 +1674,7 @@ class Firewall:
         """Send one API request with the key and return the raw HTTP response."""
         if not self.authenticated:
             raise PanError(f"not authenticated - {self.auth_reason or 'no API key'}")
+        self.check_pinned()
         ACTIVITY.touch()
         with self.lock:
             response = self.session.post(self.url, data=data, timeout=timeout or self.timeout,
@@ -1862,6 +1893,16 @@ class Firewall:
     def forget_key(self):
         self.session.headers.pop('X-PAN-KEY', None)
 
+    def pin(self, fingerprint):
+        """Accept only this certificate (SHA-256, hex) from now on, checked during every TLS handshake."""
+        self.session.mount('https://', PinnedAdapter(fingerprint, max_retries=0))
+        self.fingerprint = fingerprint
+
+    def check_pinned(self):
+        """With verify_ssl false, refuse to send anything before the certificate is pinned."""
+        if self.needs_pin and not self.fingerprint:
+            raise PanError("its certificate hasn't been checked - nothing sent")
+
     def close(self):
         self.forget_key()
         self.session.close()
@@ -2057,6 +2098,10 @@ def ident(fw):
 
 def connection_error_text(error):
     """The OS-level reason from a requests error, without urllib3's pool and retry wrapping."""
+    if 'Fingerprints did not match' in str(error):
+        # PinnedAdapter refused the connection during the TLS handshake, before anything was sent
+        return (f"its certificate isn't the one trusted for it in {CERTS_PATH.name} - possible interception, "
+                f"nothing sent")
     match = re.search(r"\[(?:WinError|Errno) -?\d+\] ([^'\")]+)", str(error))
     return match.group(1).strip() if match else str(error)
 
@@ -2128,6 +2173,129 @@ def poll_ha(fw):
         print(f"{fw}: could not read the HA state: {connection_error_text(e)}")
 
 
+# ---------------------------------------------------------------- certificates
+
+# known_certs.txt: the certificates trusted on first use while verify_ssl is false
+CERTS_HEADER = (
+    f"# {APP_TITLE}: firewall management certificates, trusted the first time each one connected\n"
+    "# (verify_ssl: false). Every later connection to that address has to present the same certificate\n"
+    "# (its SHA-256), or the tool refuses it before anything is sent. One per line: <address>:<port> <sha256>.\n"
+    "# If a certificate was replaced on purpose (renewed, or a replacement firewall), delete its line and\n"
+    "# connect again to trust the new one.\n"
+)
+FINGERPRINT = re.compile(r'^[0-9a-f]{64}$')
+
+
+def pin_key(fw):
+    """How fw's certificate is filed in known_certs.txt: the address the API connects to, and its port."""
+    return f"{ssh_host(fw).lower()}:{fw.port}"
+
+
+def certificate_fingerprint(fw):
+    """The SHA-256 (hex) of the certificate fw's management interface presents. Nothing is sent; the
+    certificate isn't checked against any CA."""
+    pem = ssl.get_server_certificate((ssh_host(fw), fw.port), timeout=CONNECT_TIMEOUT)
+    return hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem)).hexdigest()
+
+
+def read_pins():
+    """{'address:port': sha256} from known_certs.txt - empty if it doesn't exist yet."""
+    try:
+        lines = CERTS_PATH.read_text(encoding='utf-8').splitlines()
+    except FileNotFoundError:
+        return {}
+    pins = {}
+    for line in lines:
+        fields = line.split('#', 1)[0].split()
+        if len(fields) == 2 and FINGERPRINT.match(fields[1].lower()):
+            pins[fields[0].lower()] = fields[1].lower()
+    return pins
+
+
+def add_pins(new):
+    """Add {'address:port': sha256} to known_certs.txt (created with an explanation the first time)."""
+    try:
+        text = CERTS_PATH.read_text(encoding='utf-8')
+    except FileNotFoundError:
+        text = CERTS_HEADER
+    if text and not text.endswith('\n'):
+        text += '\n'
+    text += ''.join(f"{address} {fingerprint}\n" for address, fingerprint in new.items())
+    CERTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temp = CERTS_PATH.with_name(CERTS_PATH.name + '.tmp')
+    temp.write_text(text, encoding='utf-8')
+    os.replace(temp, CERTS_PATH)
+
+
+def check_certificates(firewalls):
+    """verify_ssl false: pin each firewall's certificate before anything is sent to it (trust on first
+    use). A certificate seen before (known_certs.txt) has to be the same one; new ones are listed and
+    trusted only if you say so. Returns the firewalls that can go on to authenticate; the rest are marked
+    FAIL (changed, or unreadable) or SKIPPED (not trusted), with the reason."""
+    pending = [fw for fw in firewalls if fw.needs_pin and not fw.fingerprint]
+    if not pending:
+        return firewalls
+    try:
+        pins = read_pins()
+    except (OSError, UnicodeDecodeError) as e:
+        stage('Certificates')
+        problem = f"can't read {CERTS_PATH} ({getattr(e, 'strerror', None) or e})"
+        print(f"verify_ssl is false and {problem}, so nothing is sent to {len(pending)} firewall(s) until it "
+              f"can be read.")
+        for fw in pending:
+            fw.auth_result, fw.auth_reason = FAIL, f"{problem} to check its certificate - nothing sent"
+        return [fw for fw in firewalls if fw not in pending]
+    stopped = set()
+
+    def stop(fw, result, reason):
+        fw.auth_result, fw.auth_reason = result, reason
+        stopped.add(fw)
+
+    new, changed, failed = {}, {}, {}
+    for fw, outcome in parallel(certificate_fingerprint, pending).items():
+        if isinstance(outcome, Exception):
+            reason = (f"no answer within {CONNECT_TIMEOUT}s" if isinstance(outcome, TimeoutError)
+                      else connection_error_text(outcome))
+            failed[fw] = reason
+            stop(fw, FAIL, f"could not read its certificate: {reason}")
+        elif pin_key(fw) not in pins:
+            new[fw] = outcome
+        elif pins[pin_key(fw)] != outcome:
+            changed[fw] = (pins[pin_key(fw)], outcome)
+            stop(fw, FAIL, f"its certificate has CHANGED since it was trusted - possible interception, nothing "
+                           f"sent. If it was replaced on purpose, delete the {pin_key(fw)} line in "
+                           f"{CERTS_PATH.name} and connect again")
+        else:
+            fw.pin(outcome)
+    if new or changed or failed:
+        stage('Certificates')
+        print(f"verify_ssl is false, so each firewall's certificate is trusted the first time it connects and "
+              f"has to match every time after ({CERTS_PATH}).")
+    for fw, reason in failed.items():
+        print(f"{fw}: could not read its certificate: {reason}")
+    if changed:
+        print(f"\nCHANGED since you trusted it - nothing is sent to these ({len(changed)}):")
+        for fw, (was, now) in changed.items():
+            print(f"  {fw}:\n    trusted {was}\n    now     {now}")
+        print(f"If a certificate was replaced on purpose (renewed, or a replacement firewall), delete its line in "
+              f"{CERTS_PATH} and connect again. Otherwise something may be intercepting the connection.")
+    if new:
+        print(f"\nNot seen before ({len(new)}) - check a fingerprint against the firewall's certificate if you "
+              f"can (the web UI's, in your browser):")
+        print_table([{**ident(fw), 'SHA-256 fingerprint': fingerprint} for fw, fingerprint in new.items()])
+        if confirm(f"Trust {'this certificate' if len(new) == 1 else f'these {len(new)} certificates'}?"):
+            try:
+                add_pins({pin_key(fw): fingerprint for fw, fingerprint in new.items()})
+            except OSError as e:
+                print(f"Could not save them to {CERTS_PATH} ({e.strerror}) - they're trusted for this run only.")
+            for fw, fingerprint in new.items():
+                fw.pin(fingerprint)
+        else:
+            for fw in new:
+                stop(fw, SKIPPED, "its certificate wasn't trusted - nothing sent")
+    return [fw for fw in firewalls if fw not in stopped]
+
+
 # ---------------------------------------------------------------- authentication
 
 def is_rejection(error):
@@ -2162,8 +2330,12 @@ def authenticate(firewalls, config):
     Every MFA push happens here, one firewall at a time, so the later stages never wait on one.
     A firewall only passes once its key has been accepted. Once a firewall has accepted the
     password, it's kept in memory for Connect via SSH (CREDENTIALS) until Disconnect
-    (the Disconnect option, Exit, or the idle timeout); retrying asks for it again.
+    (the Disconnect option, Exit, or the idle timeout); retrying asks for it again. With verify_ssl
+    false, each firewall's certificate is checked (pinned) first, before the password is asked for.
     """
+    firewalls = check_certificates(firewalls)
+    if not firewalls:
+        return
     stage('Authentication')
     username = prompt('Username', getpass.getuser())
     password = getpass.getpass('Password: ')
@@ -6580,7 +6752,8 @@ def main():
     try:
         if config['verify_ssl'] is False:
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-            print("WARNING: verify_ssl is false - firewall certificates are not being checked.")
+            print(f"verify_ssl is false - certificates aren't checked against a CA. Each firewall's is trusted the "
+                  f"first time it connects, and has to match every time after ({CERTS_PATH.name}).")
         watch_console_close()
         while True:
             try:
