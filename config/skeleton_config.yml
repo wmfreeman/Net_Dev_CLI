@@ -10,8 +10,11 @@ default_target: ''
 
 # false = no CA check (self-signed management certificates). Each firewall's certificate is
 #         trusted the first time it connects and has to match every time after (known_certs.txt)
-# true  = check each firewall's certificate against the system CA store
-# or the path to a CA bundle (.pem) that signed the management certificates
+# true  = check each firewall's certificate against the public CAs Python's requests library
+#         trusts (certifi) - not the Windows certificate store
+# or the path to a CA bundle (.pem) that signed the management certificates, e.g. your internal
+#         CA's; a relative path is relative to the tool's (or the EXE's) folder
+# Applies as set, even if REQUESTS_CA_BUNDLE or CURL_CA_BUNDLE is set on this PC.
 verify_ssl: false
 
 # Seconds to wait for keygen to answer. This is the time you have to approve the MFA push.

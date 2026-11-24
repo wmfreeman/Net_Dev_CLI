@@ -605,8 +605,9 @@ SETTING_CATEGORIES = {
         Setting('verify_ssl', 'ssl', False,
                 "false: no CA check (self-signed management certificates) - each firewall's certificate is "
                 "trusted the first time it connects and has to match every time after (known_certs.txt); "
-                "true checks each firewall's certificate against the system CA store; or the path to a CA "
-                "bundle (.pem)."),
+                "true checks it against the public CAs Python's requests library trusts (certifi) - not the "
+                "Windows certificate store; or the path to a CA bundle (.pem), e.g. your internal CA's, relative "
+                "to the tool's folder. Applies as set even if REQUESTS_CA_BUNDLE or CURL_CA_BUNDLE is set."),
         Setting('keygen_timeout', 'number', 90,
                 "Seconds to wait for keygen to answer - the time you have to approve the MFA push.",
                 10, zero_means_default=True),
@@ -1695,7 +1696,10 @@ class Firewall:
         self.queue_timeout = config.get('queue_timeout', 0)
         self.poll_interval = config['job_poll_interval']
         self.session = requests.Session()
-        self.session.verify = config['verify_ssl']
+        # A CA bundle path in verify_ssl is relative to the tool's folder, as Settings checks it - not to
+        # the folder the tool was started from
+        verify = config['verify_ssl']
+        self.session.verify = str(config_folder(verify)) if isinstance(verify, str) else verify
         # Exactly one attempt per call: a retried keygen would send another MFA push
         self.session.mount('https://', requests.adapters.HTTPAdapter(max_retries=0))
         # With verify_ssl false, nothing is sent until the firewall's certificate is pinned
@@ -1749,18 +1753,27 @@ class Firewall:
     def authenticated(self):
         return 'X-PAN-KEY' in self.session.headers
 
+    def _post(self, data, timeout):
+        """One POST to the API - every request the tool sends goes through here, the caller holding
+        self.lock. Redirects aren't followed: that would re-send the request (and the credentials, for
+        a keygen) somewhere else.
+
+        verify is passed on every call, not just set on the session: if REQUESTS_CA_BUNDLE or
+        CURL_CA_BUNDLE is set in the environment (often the case behind a TLS-inspecting proxy),
+        requests uses that bundle in place of the session's setting (psf/requests#3829). verify_ssl
+        false - and the certificate pinning that goes with it - would then turn into a CA check that
+        every self-signed firewall fails, and a CA bundle named in verify_ssl would be ignored."""
+        return self.session.post(self.url, data=data, timeout=timeout, allow_redirects=False,
+                                 verify=self.session.verify)
+
     def keygen(self, username, password):
         self.check_pinned()
         with self.lock:
             self.forget_key()
             # Credentials go in the POST body so they never land in a URL, proxy log or access log.
             # Redirects aren't followed: that would re-send them, and trigger another MFA push.
-            response = self.session.post(
-                self.url,
-                data={'type': 'keygen', 'user': username, 'password': password},
-                timeout=self.keygen_timeout,
-                allow_redirects=False,
-            )
+            response = self._post({'type': 'keygen', 'user': username, 'password': password},
+                                  self.keygen_timeout)
             self.last_used = time.monotonic()
         ACTIVITY.touch()
         self.keepalive_stopped = None
@@ -1777,8 +1790,7 @@ class Firewall:
         self.check_pinned()
         ACTIVITY.touch()
         with self.lock:
-            response = self.session.post(self.url, data=data, timeout=timeout or self.timeout,
-                                         allow_redirects=False)
+            response = self._post(data, timeout or self.timeout)
             self.last_used = time.monotonic()
         # A long request counts as activity for as long as it runs
         ACTIVITY.touch()
@@ -1860,8 +1872,7 @@ class Firewall:
         if not self.authenticated or self.keepalive_stopped or not self.lock.acquire(blocking=False):
             return
         try:
-            response = self.session.post(self.url, data={'type': 'op', 'cmd': KEEPALIVE_CMD},
-                                         timeout=self.timeout, allow_redirects=False)
+            response = self._post({'type': 'op', 'cmd': KEEPALIVE_CMD}, self.timeout)
             self.last_used = time.monotonic()
         except requests.ReadTimeout:
             self.keepalive_stopped = (f"no reply to a poll within {self.timeout[1]}s - the firewall may be "
@@ -1976,9 +1987,8 @@ class Firewall:
             self.forget_key()
             raise PanError("another request to it was still running")
         try:
-            response = self.session.post(self.url, data={'type': 'op', 'cmd': cmd},
-                                         timeout=(min(CONNECT_TIMEOUT, timeout), timeout) if timeout else self.timeout,
-                                         allow_redirects=False)
+            response = self._post({'type': 'op', 'cmd': cmd},
+                                  (min(CONNECT_TIMEOUT, timeout), timeout) if timeout else self.timeout)
             self.last_used = time.monotonic()
         finally:
             self.forget_key()

@@ -40,7 +40,7 @@ The script runs `poetry install`, which includes PyInstaller as a dev dependency
 
 `config/config.yml` is created from `config/skeleton_config.yml` on first run, and `config/health_checks.yaml` (the [health check thresholds](#health-check-thresholds)) from `config/skeleton_health_checks.yaml` the first time it's needed. Change them from [Settings](#settings) (Main Menu option 7), or by editing them. Set `default_target` to the firewalls you usually check (any form the Target prompt accepts), or leave it blank. Once the [local data file](#local-data-file) holds devices, those are the default instead.
 
-By default (`verify_ssl: false`) certificates aren't checked against a CA, because firewall management interfaces use self-signed certificates. Instead, each firewall's certificate is trusted the first time you connect to it and pinned: every connection after that has to present the same one, or nothing is sent (see [Certificates](#certificates)). Set `verify_ssl` to `true`, or to the path of a CA bundle, if your certificates are signed by a CA you trust.
+By default (`verify_ssl: false`) certificates aren't checked against a CA, because firewall management interfaces use self-signed certificates. Instead, each firewall's certificate is trusted the first time you connect to it and pinned: every connection after that has to present the same one, or nothing is sent (see [Certificates](#certificates)). If your management certificates are signed by a CA you trust, set `verify_ssl` to the path of that CA's bundle (`.pem`; a relative path is relative to the tool's folder). `true` checks against the public CAs Python's requests library trusts (certifi), not the Windows certificate store, so it suits only certificates from a public CA.
 
 ## Usage
 
@@ -369,6 +369,7 @@ Management interfaces use self-signed certificates, so with `verify_ssl: false` 
 - **A changed certificate is refused:** the firewall fails with `its certificate has CHANGED since it was trusted - possible interception, nothing sent`, and both fingerprints are shown. If it was replaced on purpose (a renewed certificate, or a replacement firewall at that address), delete its line in `known_certs.txt` and connect again.
 - **Not read:** a firewall whose certificate can't be read (no answer, refused) fails before anything is sent.
 - A firewall reached at a different address (its hostname instead of its IP, say) is a separate entry, trusted the first time too. With `verify_ssl: true` or a CA bundle, certificates are checked against the CA instead and nothing is pinned.
+- **Your PC's CA settings don't override it:** `verify_ssl` applies as set even when `REQUESTS_CA_BUNDLE` or `CURL_CA_BUNDLE` is set, as it often is behind a TLS-inspecting proxy. Python's requests library would otherwise use that bundle in its place, and every self-signed firewall would fail with `CERTIFICATE_VERIFY_FAILED`.
 
 #### Session timeouts and the keep-alive
 
@@ -899,7 +900,7 @@ At start-up, logs and results files older than `log_retention_days` are deleted.
 | Option | Default | What it does |
 |--------|---------|--------------|
 | `default_target` | `''` | Offered at the Target prompt when no devices are known: one firewall, a list, or a file path |
-| `verify_ssl` | `false` | Certificate checking: `false` (each firewall's certificate trusted on first use and pinned in `known_certs.txt`, see [Certificates](#certificates)), `true`, or the path to a CA bundle |
+| `verify_ssl` | `false` | Certificate checking: `false` (each firewall's certificate trusted on first use and pinned in `known_certs.txt`, see [Certificates](#certificates)), `true` (the public CAs requests trusts, not the Windows store), or the path to a CA bundle (relative to the tool's folder). Applies as set even if `REQUESTS_CA_BUNDLE` or `CURL_CA_BUNDLE` is set |
 | `keygen_timeout` | `90` | Seconds to approve the MFA push |
 | `request_timeout` | `30` | Seconds to wait for any other API call, and for ssh to connect to a JumpHost |
 | `check_timeout` | `120` | Seconds to wait for an update check, a snapshot, a system state export, a log search or a JumpHost test |
