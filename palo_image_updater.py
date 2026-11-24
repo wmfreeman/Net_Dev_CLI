@@ -6,6 +6,7 @@ Credentials and API keys are held in memory for this run only and never written 
 """
 import contextlib
 import getpass
+import hashlib
 import ipaddress
 import os
 import re
@@ -13,6 +14,7 @@ import secrets
 import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import textwrap
@@ -35,9 +37,11 @@ BASE_DIR = Path(sys.executable if FROZEN else __file__).resolve().parent
 BUNDLE_DIR = Path(getattr(sys, '_MEIPASS', BASE_DIR))
 CONFIG_PATH = BASE_DIR / 'config' / 'config.yml'
 SKELETON_PATH = BUNDLE_DIR / 'config' / 'skeleton_config.yml'
+# verify_ssl false: each firewall's certificate, trusted the first time it connects (check_certificates)
+CERTS_PATH = BASE_DIR / 'config' / 'known_certs.txt'
 
 APP_TITLE = 'Net_Dev_CLI'
-REPO_URL = 'https://github.com/wmfreeman/palo-toolkit'
+REPO_URL = 'https://github.com/wmfreeman/Net_Dev_CLI'
 GIT_TIMEOUT = 60
 # A change to either means the dependencies need reinstalling after an update
 DEPENDENCY_FILES = ('pyproject.toml', 'poetry.lock')
@@ -47,11 +51,13 @@ DEFAULT_PORT = 443
 # Connect via SSH (Palo Firewall Management option 8) uses Windows' built-in OpenSSH client
 SSH_CLIENT = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32' / 'OpenSSH' / 'ssh.exe'
 SSH_VERSION = re.compile(r'OpenSSH\w*?_(\d+)\.(\d+)')
-# SSH_ASKPASS_REQUIRE, which lets ssh take the password from this tool, arrived in OpenSSH 8.4
-SSH_ASKPASS_VERSION = (8, 4)
+# Filling in the password needs OpenSSH 8.5: SSH_ASKPASS_REQUIRE (8.4) lets ssh take it from this
+# tool, and 8.5 starts every keyboard-interactive prompt with '(user@host)', so a prompt a JumpHost
+# sends can't pass for the firewall's (prompt_names)
+SSH_ASKPASS_VERSION = (8, 5)
 # Set only in ssh's environment: tells this tool, started again by ssh to answer a prompt, where to
 # fetch the password (AskpassServer)
-ASKPASS_ENV = 'PALO_UPDATER_ASKPASS'
+ASKPASS_ENV = 'NET_DEV_CLI_ASKPASS'
 # ssh prompts: a password (filled in once) and a yes/no question (the host key; typed, with echo)
 SSH_PASSWORD_PROMPT = re.compile(r'password', re.IGNORECASE)
 SSH_CONFIRM_PROMPT = re.compile(r'\(yes/no', re.IGNORECASE)
@@ -177,9 +183,10 @@ IMAGE_CORRUPT = re.compile(r'md5sum|checksums? did not match|authentication erro
 MANAGEMENT_LOST = re.compile(r'actively refused|response was not xml|remote end closed|connection aborted|'
                              r'lost track of job', re.IGNORECASE)
 
-# Config snapshots are saved on the firewall as <YYYY-MM-DD>.xml, and downloaded as
-# <hostname>_<snapshot name>
-SNAPSHOT_NAME = re.compile(r'^\d{4}-\d{2}-\d{2}\.xml$')
+# Config snapshots are saved on the firewall as <YYYY-MM-DD_HHMMSS>.xml - the time keeps a second
+# snapshot the same day from replacing the first - and downloaded as <hostname>_<snapshot name>.
+# Older versions of the tool saved <YYYY-MM-DD>.xml, which still counts as the tool's own.
+SNAPSHOT_NAME = re.compile(r'^\d{4}-\d{2}-\d{2}(?:_\d{6})?\.xml$')
 SNAPSHOT_DATE = re.compile(r'\d{4}-\d{2}-\d{2}')
 # Completion point for 'show config saved <name>', which lists the saved snapshots
 SAVED_CONFIGS_XPATH = '/operations/show/config/saved'
@@ -596,8 +603,10 @@ SETTING_CATEGORIES = {
     ],
     'Connection': [
         Setting('verify_ssl', 'ssl', False,
-                "false skips the certificate check (self-signed management certificates); true checks each "
-                "firewall's certificate against the system CA store; or the path to a CA bundle (.pem)."),
+                "false: no CA check (self-signed management certificates) - each firewall's certificate is "
+                "trusted the first time it connects and has to match every time after (known_certs.txt); "
+                "true checks each firewall's certificate against the system CA store; or the path to a CA "
+                "bundle (.pem)."),
         Setting('keygen_timeout', 'number', 90,
                 "Seconds to wait for keygen to answer - the time you have to approve the MFA push.",
                 10, zero_means_default=True),
@@ -613,6 +622,11 @@ SETTING_CATEGORIES = {
         Setting('app_idle_timeout', 'number', APP_IDLE_TIMEOUT,
                 "Minutes with no activity before the tool logs out, clears the API keys and returns to the Main Menu. "
                 "0 never disconnects.", 0),
+        Setting('logout_on_disconnect', 'onoff', True,
+                "On: Disconnect (also Exit, Ctrl+C, the idle timeout, an error, closing the window) logs out of each "
+                "firewall with delete admin-sessions, which ends every CLI and API session that admin has on it - "
+                "your other SSH sessions too, and anyone else's on the same account. Off: the keys and the password "
+                "are only cleared from memory, and each session ends at the firewall's own idle timeout."),
     ],
     'Jobs & Downloads': [
         Setting('job_timeout', 'number', 1800,
@@ -651,13 +665,28 @@ SETTINGS = {s.key: s for group in SETTING_CATEGORIES.values() for s in group}
 SETTINGS[JUMP_CHAINING.key] = JUMP_CHAINING
 
 
+class ConfigLoadError(Exception):
+    """config.yml can't be created or read, so the tool can't start. Says why, and what to do."""
+
+
 def load_config():
-    if not CONFIG_PATH.exists():
-        print(f"Config file not found - creating {CONFIG_PATH} from the skeleton.")
-        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(SKELETON_PATH, CONFIG_PATH)
-    with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f) or {}
+    """config.yml, every value checked (created from the skeleton the first time). Raises
+    ConfigLoadError if the file can't be created or read, or isn't YAML key: value settings."""
+    fix = (f"Fix it and start the tool again ({CONFIG_PATH.name}.bak, if there is one, is the copy before the "
+           f"last Settings change).")
+    try:
+        if not CONFIG_PATH.exists():
+            print(f"Config file not found - creating {CONFIG_PATH} from the skeleton.")
+            CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(SKELETON_PATH, CONFIG_PATH)
+        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+            config = yaml.safe_load(f) or {}
+    except yaml.YAMLError as e:
+        raise ConfigLoadError(f"{CONFIG_PATH} isn't valid YAML. {fix}\n{e}") from None
+    except (OSError, UnicodeDecodeError) as e:
+        raise ConfigLoadError(f"can't read {CONFIG_PATH}: {getattr(e, 'strerror', None) or e}") from None
+    if not isinstance(config, dict):
+        raise ConfigLoadError(f"{CONFIG_PATH} isn't a list of key: value settings. {fix}")
 
     # Older configs listed the firewalls under 'firewalls'
     old_list = [str(h).strip() for h in config.pop('firewalls', None) or [] if str(h).strip()]
@@ -672,6 +701,8 @@ def load_config():
                                                 setting.high, setting.zero_means_default)
         elif setting.kind == 'path':
             config[setting.key] = str(config.get(setting.key) or setting.default)
+        elif setting.kind == 'onoff' and setting is not JUMP_CHAINING:
+            config[setting.key] = setting.read(config, CONFIG_PATH.name)
     chaining = config.get(JUMP_CHAINING.key)
     config[JUMP_CHAINING.key] = (JUMP_CHAINING.default if chaining is None
                                  else str(chaining).lower() in ON_WORDS)
@@ -996,14 +1027,88 @@ ESC, DEL = 'esc', 'del'
 CANCEL = object()
 
 
+@contextlib.contextmanager
+def console_keys():
+    """The keys typed on the console, one at a time, for read_key_line: characters (Enter is '\\r' or
+    '\\n', Backspace '\\x08', Esc '\\x1b', Ctrl+C '\\x03'), DEL for the Delete key, and '' for other
+    special keys (arrows...). None if the console can't be read a key at a time.
+
+    Windows reads them with msvcrt. Elsewhere (macOS, Linux) the terminal is put in cbreak mode - no echo,
+    a key at a time, Ctrl+C still interrupts - and set back afterwards; Delete arrives as the escape
+    sequence ESC [ 3 ~, told apart from Esc pressed alone by whether more follows straight away."""
+    try:
+        import msvcrt
+    except ImportError:
+        msvcrt = None
+    if msvcrt:
+        def windows_keys():
+            while True:
+                ch = msvcrt.getwch()
+                if ch in '\x00\xe0':
+                    # A special key: Delete is 'S'; arrows and the rest are ignored
+                    yield DEL if msvcrt.getwch() == 'S' else ''
+                else:
+                    yield ch
+        yield windows_keys()
+        return
+    try:
+        import select
+        import termios
+        import tty
+    except ImportError:
+        yield None
+        return
+    try:
+        fd = sys.stdin.fileno()
+        saved = termios.tcgetattr(fd)
+        # TCSANOW: keys typed ahead of the prompt are kept
+        tty.setcbreak(fd, termios.TCSANOW)
+    except (OSError, ValueError, termios.error):
+        yield None
+        return
+    import codecs
+    decoder = codecs.getincrementaldecoder(sys.stdin.encoding or 'utf-8')(errors='replace')
+
+    def char():
+        while True:
+            data = os.read(fd, 1)
+            if not data:
+                raise EOFError
+            text = decoder.decode(data)
+            if text:
+                return text
+
+    def posix_keys():
+        while True:
+            ch = char()
+            if ch != '\x1b':
+                # Backspace sends DEL (\x7f) on most terminals
+                yield '\x08' if ch == '\x7f' else ch
+            elif not select.select([fd], [], [], 0.05)[0]:
+                yield ch   # Esc on its own
+            else:
+                # An escape sequence: ESC [ 3 ~ is Delete; the rest (arrows, Home, F keys...) are ignored
+                kind, sequence = char(), ''
+                if kind == '[':
+                    while not '@' <= (last := char()) <= '~':
+                        sequence += last
+                    sequence += last
+                elif kind == 'O':
+                    char()
+                yield DEL if (kind, sequence) == ('[', '3~') else ''
+    try:
+        yield posix_keys()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
 def read_key_line(text):
     """Ask for a line on the console a key at a time, so Esc and Delete can be told apart from text.
     Returns (typed text, None) on Enter, (None, ESC) on Esc, or (None, DEL) on Delete. The prompt and
-    what's typed are shown, and logged, as with ask(). Without a console (input piped in) it reads an
-    ordinary line instead."""
+    what's typed are shown, and logged, as with ask(). Without a console (input piped in), or one that
+    can't be read a key at a time, it reads an ordinary line instead."""
     if not sys.stdin.isatty():
         return ask(text), None
-    import msvcrt
     # Echoed to the screen only; the finished line goes to the log once, at the end
     screen = sys.stdout.stream if isinstance(sys.stdout, _Tee) else sys.stdout
 
@@ -1011,32 +1116,33 @@ def read_key_line(text):
         screen.write(s)
         screen.flush()
 
-    show(text)
     chars, key, ending = [], None, ''
-    while True:
-        ch = msvcrt.getwch()
-        if ch in '\r\n':
-            break
-        if ch == '\x03':
-            show('\n')
-            raise KeyboardInterrupt
-        if ch == '\x1b':
-            key, ending = ESC, '  (Esc - cancelled)'
-            break
-        if ch in '\x00\xe0':
-            # A special key: Delete is 'S'; arrows and the rest are ignored
-            if msvcrt.getwch() == 'S':
+    with console_keys() as keys:
+        if keys is None:
+            return ask(text), None
+        show(text)
+        for ch in keys:
+            if not ch:
+                continue   # a special key that isn't used
+            if ch in ('\r', '\n'):
+                break
+            if ch == '\x03':
+                show('\n')
+                raise KeyboardInterrupt
+            if ch == '\x1b':
+                key, ending = ESC, '  (Esc - cancelled)'
+                break
+            if ch == DEL:
                 key, ending = DEL, '  (Del - default)'
                 break
-            continue
-        if ch == '\x08':
-            if chars:
-                chars.pop()
-                show('\b \b')
-            continue
-        if ch.isprintable():
-            chars.append(ch)
-            show(ch)
+            if ch == '\x08':
+                if chars:
+                    chars.pop()
+                    show('\b \b')
+                continue
+            if ch.isprintable():
+                chars.append(ch)
+                show(ch)
     show(ending + '\n')
     line = ''.join(chars)
     log_only(f"{text}{line}{ending}")
@@ -1218,12 +1324,14 @@ def read_data_rows(path):
     the tool doesn't know keep their own name. Returns (rows, header)."""
     import csv
     with open(path, newline='', encoding='utf-8-sig') as f:
-        lines = [line for line in f if line.strip() and not line.lstrip().startswith('#')]
-    reader = csv.reader(lines)
-    header = next(reader, [])
+        # Parsed as CSV first, so a quoted cell can hold several lines (Alt+Enter in Excel) - blank ones
+        # and ones starting with # included. Only then are blank rows and # comment rows left out.
+        records = [values for values in csv.reader(f)
+                   if any(value.strip() for value in values) and not values[0].lstrip().startswith('#')]
+    header = records[0] if records else []
     names = [data_column(h) or h.strip() for h in header]
     rows = []
-    for values in reader:
+    for values in records[1:]:
         row = {}
         for name, value in zip(names, values):
             value = value.strip()
@@ -1537,6 +1645,25 @@ def parse_response(response):
     return root
 
 
+class PinnedAdapter(requests.adapters.HTTPAdapter):
+    """Accepts only the one certificate whose SHA-256 is fingerprint. urllib3 checks it during the TLS
+    handshake of every connection - direct or through a proxy - before the request (credentials
+    included) is sent, so a different certificate gets nothing."""
+
+    def __init__(self, fingerprint, **kwargs):
+        # Set first: HTTPAdapter.__init__ calls init_poolmanager
+        self.fingerprint = fingerprint
+        super().__init__(**kwargs)
+
+    def init_poolmanager(self, *args, **kwargs):
+        kwargs['assert_fingerprint'] = self.fingerprint
+        super().init_poolmanager(*args, **kwargs)
+
+    def proxy_manager_for(self, proxy, **proxy_kwargs):
+        proxy_kwargs['assert_fingerprint'] = self.fingerprint
+        return super().proxy_manager_for(proxy, **proxy_kwargs)
+
+
 class Firewall:
     """One firewall's XML API session. Its API key lives only in this object's headers."""
 
@@ -1571,6 +1698,10 @@ class Firewall:
         self.session.verify = config['verify_ssl']
         # Exactly one attempt per call: a retried keygen would send another MFA push
         self.session.mount('https://', requests.adapters.HTTPAdapter(max_retries=0))
+        # With verify_ssl false, nothing is sent until the firewall's certificate is pinned
+        # (check_certificates, pin): its SHA-256, checked on every connection after that
+        self.needs_pin = config['verify_ssl'] is False
+        self.fingerprint = None
         self.auth_result = None
         self.auth_reason = ''
         # The admin whose key this is: Disconnect logs that admin's sessions out (logout)
@@ -1619,6 +1750,7 @@ class Firewall:
         return 'X-PAN-KEY' in self.session.headers
 
     def keygen(self, username, password):
+        self.check_pinned()
         with self.lock:
             self.forget_key()
             # Credentials go in the POST body so they never land in a URL, proxy log or access log.
@@ -1642,6 +1774,7 @@ class Firewall:
         """Send one API request with the key and return the raw HTTP response."""
         if not self.authenticated:
             raise PanError(f"not authenticated - {self.auth_reason or 'no API key'}")
+        self.check_pinned()
         ACTIVITY.touch()
         with self.lock:
             response = self.session.post(self.url, data=data, timeout=timeout or self.timeout,
@@ -1860,6 +1993,16 @@ class Firewall:
     def forget_key(self):
         self.session.headers.pop('X-PAN-KEY', None)
 
+    def pin(self, fingerprint):
+        """Accept only this certificate (SHA-256, hex) from now on, checked during every TLS handshake."""
+        self.session.mount('https://', PinnedAdapter(fingerprint, max_retries=0))
+        self.fingerprint = fingerprint
+
+    def check_pinned(self):
+        """With verify_ssl false, refuse to send anything before the certificate is pinned."""
+        if self.needs_pin and not self.fingerprint:
+            raise PanError("its certificate hasn't been checked - nothing sent")
+
     def close(self):
         self.forget_key()
         self.session.close()
@@ -2055,6 +2198,10 @@ def ident(fw):
 
 def connection_error_text(error):
     """The OS-level reason from a requests error, without urllib3's pool and retry wrapping."""
+    if 'Fingerprints did not match' in str(error):
+        # PinnedAdapter refused the connection during the TLS handshake, before anything was sent
+        return (f"its certificate isn't the one trusted for it in {CERTS_PATH.name} - possible interception, "
+                f"nothing sent")
     match = re.search(r"\[(?:WinError|Errno) -?\d+\] ([^'\")]+)", str(error))
     return match.group(1).strip() if match else str(error)
 
@@ -2126,6 +2273,129 @@ def poll_ha(fw):
         print(f"{fw}: could not read the HA state: {connection_error_text(e)}")
 
 
+# ---------------------------------------------------------------- certificates
+
+# known_certs.txt: the certificates trusted on first use while verify_ssl is false
+CERTS_HEADER = (
+    f"# {APP_TITLE}: firewall management certificates, trusted the first time each one connected\n"
+    "# (verify_ssl: false). Every later connection to that address has to present the same certificate\n"
+    "# (its SHA-256), or the tool refuses it before anything is sent. One per line: <address>:<port> <sha256>.\n"
+    "# If a certificate was replaced on purpose (renewed, or a replacement firewall), delete its line and\n"
+    "# connect again to trust the new one.\n"
+)
+FINGERPRINT = re.compile(r'^[0-9a-f]{64}$')
+
+
+def pin_key(fw):
+    """How fw's certificate is filed in known_certs.txt: the address the API connects to, and its port."""
+    return f"{ssh_host(fw).lower()}:{fw.port}"
+
+
+def certificate_fingerprint(fw):
+    """The SHA-256 (hex) of the certificate fw's management interface presents. Nothing is sent; the
+    certificate isn't checked against any CA."""
+    pem = ssl.get_server_certificate((ssh_host(fw), fw.port), timeout=CONNECT_TIMEOUT)
+    return hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem)).hexdigest()
+
+
+def read_pins():
+    """{'address:port': sha256} from known_certs.txt - empty if it doesn't exist yet."""
+    try:
+        lines = CERTS_PATH.read_text(encoding='utf-8').splitlines()
+    except FileNotFoundError:
+        return {}
+    pins = {}
+    for line in lines:
+        fields = line.split('#', 1)[0].split()
+        if len(fields) == 2 and FINGERPRINT.match(fields[1].lower()):
+            pins[fields[0].lower()] = fields[1].lower()
+    return pins
+
+
+def add_pins(new):
+    """Add {'address:port': sha256} to known_certs.txt (created with an explanation the first time)."""
+    try:
+        text = CERTS_PATH.read_text(encoding='utf-8')
+    except FileNotFoundError:
+        text = CERTS_HEADER
+    if text and not text.endswith('\n'):
+        text += '\n'
+    text += ''.join(f"{address} {fingerprint}\n" for address, fingerprint in new.items())
+    CERTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temp = CERTS_PATH.with_name(CERTS_PATH.name + '.tmp')
+    temp.write_text(text, encoding='utf-8')
+    os.replace(temp, CERTS_PATH)
+
+
+def check_certificates(firewalls):
+    """verify_ssl false: pin each firewall's certificate before anything is sent to it (trust on first
+    use). A certificate seen before (known_certs.txt) has to be the same one; new ones are listed and
+    trusted only if you say so. Returns the firewalls that can go on to authenticate; the rest are marked
+    FAIL (changed, or unreadable) or SKIPPED (not trusted), with the reason."""
+    pending = [fw for fw in firewalls if fw.needs_pin and not fw.fingerprint]
+    if not pending:
+        return firewalls
+    try:
+        pins = read_pins()
+    except (OSError, UnicodeDecodeError) as e:
+        stage('Certificates')
+        problem = f"can't read {CERTS_PATH} ({getattr(e, 'strerror', None) or e})"
+        print(f"verify_ssl is false and {problem}, so nothing is sent to {len(pending)} firewall(s) until it "
+              f"can be read.")
+        for fw in pending:
+            fw.auth_result, fw.auth_reason = FAIL, f"{problem} to check its certificate - nothing sent"
+        return [fw for fw in firewalls if fw not in pending]
+    stopped = set()
+
+    def stop(fw, result, reason):
+        fw.auth_result, fw.auth_reason = result, reason
+        stopped.add(fw)
+
+    new, changed, failed = {}, {}, {}
+    for fw, outcome in parallel(certificate_fingerprint, pending).items():
+        if isinstance(outcome, Exception):
+            reason = (f"no answer within {CONNECT_TIMEOUT}s" if isinstance(outcome, TimeoutError)
+                      else connection_error_text(outcome))
+            failed[fw] = reason
+            stop(fw, FAIL, f"could not read its certificate: {reason}")
+        elif pin_key(fw) not in pins:
+            new[fw] = outcome
+        elif pins[pin_key(fw)] != outcome:
+            changed[fw] = (pins[pin_key(fw)], outcome)
+            stop(fw, FAIL, f"its certificate has CHANGED since it was trusted - possible interception, nothing "
+                           f"sent. If it was replaced on purpose, delete the {pin_key(fw)} line in "
+                           f"{CERTS_PATH.name} and connect again")
+        else:
+            fw.pin(outcome)
+    if new or changed or failed:
+        stage('Certificates')
+        print(f"verify_ssl is false, so each firewall's certificate is trusted the first time it connects and "
+              f"has to match every time after ({CERTS_PATH}).")
+    for fw, reason in failed.items():
+        print(f"{fw}: could not read its certificate: {reason}")
+    if changed:
+        print(f"\nCHANGED since you trusted it - nothing is sent to these ({len(changed)}):")
+        for fw, (was, now) in changed.items():
+            print(f"  {fw}:\n    trusted {was}\n    now     {now}")
+        print(f"If a certificate was replaced on purpose (renewed, or a replacement firewall), delete its line in "
+              f"{CERTS_PATH} and connect again. Otherwise something may be intercepting the connection.")
+    if new:
+        print(f"\nNot seen before ({len(new)}) - check a fingerprint against the firewall's certificate if you "
+              f"can (the web UI's, in your browser):")
+        print_table([{**ident(fw), 'SHA-256 fingerprint': fingerprint} for fw, fingerprint in new.items()])
+        if confirm(f"Trust {'this certificate' if len(new) == 1 else f'these {len(new)} certificates'}?"):
+            try:
+                add_pins({pin_key(fw): fingerprint for fw, fingerprint in new.items()})
+            except OSError as e:
+                print(f"Could not save them to {CERTS_PATH} ({e.strerror}) - they're trusted for this run only.")
+            for fw, fingerprint in new.items():
+                fw.pin(fingerprint)
+        else:
+            for fw in new:
+                stop(fw, SKIPPED, "its certificate wasn't trusted - nothing sent")
+    return [fw for fw in firewalls if fw not in stopped]
+
+
 # ---------------------------------------------------------------- authentication
 
 def is_rejection(error):
@@ -2160,8 +2430,12 @@ def authenticate(firewalls, config):
     Every MFA push happens here, one firewall at a time, so the later stages never wait on one.
     A firewall only passes once its key has been accepted. Once a firewall has accepted the
     password, it's kept in memory for Connect via SSH (CREDENTIALS) until Disconnect
-    (the Disconnect option, Exit, or the idle timeout); retrying asks for it again.
+    (the Disconnect option, Exit, or the idle timeout); retrying asks for it again. With verify_ssl
+    false, each firewall's certificate is checked (pinned) first, before the password is asked for.
     """
+    firewalls = check_certificates(firewalls)
+    if not firewalls:
+        return
     stage('Authentication')
     username = prompt('Username', getpass.getuser())
     password = getpass.getpass('Password: ')
@@ -3025,11 +3299,12 @@ def current_release(releases):
 
 # ---------------------------------------------------------------- content installs
 
-def content_steps(content, release, latest=False, disable_new_apps=False):
+def content_steps(content, release, disable_new_apps=False):
     """Download (unless already downloaded) and install steps for one content release.
 
-    latest uses the 'latest' keyword, as Palo Alto's API docs do for installing the newest
-    release; otherwise the release is named. GP Client packages are downloaded and activated by version.
+    The release is named - its file and version, as the update check listed them - never 'latest',
+    which could pick a release published since the check (WildFire's come every few minutes): what's
+    installed is what the plan showed. GP Client packages are downloaded and activated by version.
     disable_new_apps sets 'Disable new apps in content update' on an Apps & Threats install.
     """
     outer, inner = CONTENT_TYPES[content][0]
@@ -3038,9 +3313,6 @@ def content_steps(content, release, latest=False, disable_new_apps=False):
     if content == 'GP Client':
         download = f"<download><version>{version}</version></download>"
         install = f"<activate><version>{version}</version></activate>"
-    elif latest:
-        download = '<download><latest></latest></download>'
-        install = f"<install>{options}<version>latest</version></install>"
     else:
         download = f"<download><file>{release.get('filename', '')}</file></download>"
         install = f"<install>{options}<version>{version}</version></install>"
@@ -3057,6 +3329,12 @@ def content_steps(content, release, latest=False, disable_new_apps=False):
 
 def step_text(release):
     return 'Download + install' if release.get('downloaded') != 'yes' else 'Install (already downloaded)'
+
+
+def no_file_to_download(content, release):
+    """Whether a release still has to be downloaded, but the update check gave no file name for it
+    (GP Client packages are downloaded by version, so they never need one)."""
+    return content != 'GP Client' and release.get('downloaded') != 'yes' and not release.get('filename')
 
 
 def new_apps_text(disable_new_apps):
@@ -3091,6 +3369,8 @@ def install_current(firewalls, contents):
                 row['Action'] = 'Skip - update check failed'
             elif releases[0].get('current') == 'yes':
                 row['Action'] = 'Skip - up to date'
+            elif no_file_to_download(content, releases[0]):
+                row['Action'] = "Skip - the firewall didn't list a file name to download"
             else:
                 candidates.append((content, fw, row, releases[0]))
                 row['Install'] = releases[0]['version']
@@ -3124,7 +3404,7 @@ def install_current(firewalls, contents):
 
     plans = {}
     for content, fw, row, release in candidates:
-        plans.setdefault(fw, []).extend(content_steps(content, release, True, disable_new_apps))
+        plans.setdefault(fw, []).extend(content_steps(content, release, disable_new_apps))
         if content == 'Apps & Threats':
             row['Action'] += f" - {new_apps_text(disable_new_apps)}"
     return run_plan(rows, plans, 'Install', firewalls)
@@ -3175,8 +3455,7 @@ def advanced_install(firewalls, contents):
             row['Action'] = 'Skip - this firewall does not list that version'
         elif release.get('current') == 'yes':
             row['Action'] = 'Skip - already installed'
-        elif (content != 'GP Client' and release.get('downloaded') != 'yes'
-              and not release.get('filename')):
+        elif no_file_to_download(content, release):
             row['Action'] = "Skip - the firewall didn't list a file name to download"
         else:
             plans[fw] = content_steps(content, release, disable_new_apps=disable_new_apps)
@@ -3739,14 +4018,15 @@ def device_name(fw):
     return file_safe(fw.hostname or fw.name)
 
 
-def snapshot_name(day):
-    """The name a snapshot is saved under on the firewall: '<YYYY-MM-DD>.xml'."""
-    return f"{day.isoformat()}.xml"
+def snapshot_name(moment):
+    """The name a snapshot is saved under on the firewall: '<YYYY-MM-DD_HHMMSS>.xml'."""
+    return f"{moment:%Y-%m-%d_%H%M%S}.xml"
 
 
 def newest_snapshot(names):
-    """The most recent snapshot: the latest <YYYY-MM-DD>.xml saved by this tool if there is one,
-    otherwise the name with the latest date in it. None if no name has a date."""
+    """The most recent snapshot: the latest <YYYY-MM-DD_HHMMSS>.xml (or older <YYYY-MM-DD>.xml) saved by
+    this tool if there is one - they sort by date, then time - otherwise the name with the latest date in
+    it. None if no name has a date."""
     own = [name for name in names if SNAPSHOT_NAME.match(name)]
     if own:
         return max(own)
@@ -3787,7 +4067,7 @@ def create_snapshots(firewalls):
     if not selected:
         return
     stage('Create Config Snapshot')
-    name = snapshot_name(datetime.date.today())
+    name = snapshot_name(datetime.datetime.now())
     print(f"Snapshot name on each firewall: {name}")
     print("A snapshot holds the candidate configuration, including any changes that aren't committed yet.")
     if not confirm(f"Save {name} on {len(selected)} firewall(s)?"):
@@ -5266,7 +5546,7 @@ class AskpassServer:
         # so a JumpHost's prompts never get it
         self.target = target
         self.key = secrets.token_bytes(32)
-        self.address = rf"\\.\pipe\palo-updater-askpass-{secrets.token_hex(16)}"
+        self.address = rf"\\.\pipe\net-dev-cli-askpass-{secrets.token_hex(16)}"
         self.listener = Listener(self.address, family='AF_PIPE', authkey=self.key)
         self.done = threading.Event()
         self.served = False
@@ -5345,10 +5625,15 @@ def console_answer(prompt, echo):
 
 
 def prompt_names(prompt, target):
-    """Whether an ssh prompt is for target (['user@host'], from ASKPASS_ENV): the name has to be
-    followed by "'s password" or ")", so admin@10.1.0.2 doesn't match a prompt for admin@10.1.0.25."""
+    """Whether an ssh prompt is the firewall's own password prompt for target (['user@host'], from
+    ASKPASS_ENV). It has to start with target, the way ssh writes those prompts: "user@host's password: "
+    (a password login) or "(user@host) ..." (keyboard-interactive, OpenSSH 8.5+). A JumpHost can put any
+    text in its own keyboard-interactive prompt, but ssh starts that prompt with the JumpHost's
+    (user@host) - so a prompt that only mentions the firewall further on never gets the password. The
+    name has to be followed by "'s password" or ")", so admin@10.1.0.2 doesn't match admin@10.1.0.25."""
     target = target[0] if target else ''
-    return bool(target) and bool(re.search(re.escape(target) + r"(?=['\)])", prompt, re.IGNORECASE))
+    name = re.escape(target)
+    return bool(target) and bool(re.match(rf"(?:{name}'s password|\({name}\))", prompt, re.IGNORECASE))
 
 
 def askpass_main(args):
@@ -5391,9 +5676,12 @@ def ssh_fill_blocker(version):
     """Why the password can't be filled in for any firewall, or None if it can."""
     if not FROZEN:
         return "running from source, and ssh can only take a password from a program - the EXE fills it in"
-    if version and version < SSH_ASKPASS_VERSION:
-        return (f"this OpenSSH client ({version[0]}.{version[1]}) is older than 8.4, which can't take a "
-                f"password from the tool")
+    needed = '.'.join(map(str, SSH_ASKPASS_VERSION))
+    if not version:
+        return f"the OpenSSH client's version couldn't be read, and filling in needs {needed} or later"
+    if version < SSH_ASKPASS_VERSION:
+        return (f"this OpenSSH client ({version[0]}.{version[1]}) is older than {needed}, which the tool "
+                f"needs to fill in the password safely")
     return None
 
 
@@ -5565,6 +5853,9 @@ class Connection:
         self.firewalls = []
         self.keepalive = None
         self.lock = threading.Lock()
+        # The run's config (the same dict Settings changes), so Disconnect reads logout_on_disconnect
+        # as it is when it runs
+        self.config = None
 
     @property
     def connected(self):
@@ -5598,14 +5889,18 @@ def disconnect(reason, timeout=None, wait=None, quiet=False):
     if keepalive:
         keepalive.stop()
     holding = [fw for fw in firewalls if fw.authenticated]
-    if holding:
+    logout = (CONNECTION.config or {}).get('logout_on_disconnect', True)
+    outcomes = {}
+    if holding and logout:
         with contextlib.suppress(OSError):
             say(f"\nDisconnecting ({reason}) - logging out of {len(holding)} firewall(s)...")
         with ThreadPoolExecutor(max_workers=min(len(holding), LOGOUT_PARALLEL)) as pool:
             futures = {fw: pool.submit(fw.logout, timeout, wait) for fw in holding}
         outcomes = {fw: future.exception() for fw, future in futures.items()}
-    else:
-        outcomes = {}
+    elif holding:
+        with contextlib.suppress(OSError):
+            say(f"\nDisconnecting ({reason}) - logout_on_disconnect is off, so {len(holding)} firewall(s) aren't "
+                f"logged out; their keys are cleared.")
     CREDENTIALS.clear()
     for fw in firewalls:
         fw.close()
@@ -5618,6 +5913,9 @@ def disconnect(reason, timeout=None, wait=None, quiet=False):
             else:
                 text = connection_error_text(error) if isinstance(error, requests.RequestException) else str(error)
                 result, detail = FAIL, f"{text} - the session ends at the firewall's idle timeout"
+        elif fw in holding:
+            result, detail = 'Key cleared', ("not logged out (logout_on_disconnect is off) - the session ends at "
+                                             "the firewall's idle timeout")
         elif fw.username:
             result, detail = '-', f"no key held ({fw.auth_reason or 'session already ended'})"
         else:
@@ -5640,6 +5938,7 @@ def connect(config):
     """Main Menu option 1: pick firewalls and authenticate them, then back to the Main Menu (Manage
     Devices opens their menu). Firewalls already connected stay connected and the new ones join
     them; one already in the session isn't added twice (one without a key is authenticated again)."""
+    CONNECTION.config = config
     targets = choose_targets(config)
     if not targets:
         return
@@ -6193,7 +6492,7 @@ def ssh_config_file(config, batch=False):
     deletes it afterwards. It holds no passwords. ssh hands the path on to each JumpHost connection
     without quotes, so it has to have no spaces (ValueError otherwise)."""
     import tempfile
-    folder = Path(tempfile.mkdtemp(prefix='palo-ssh-'))
+    folder = Path(tempfile.mkdtemp(prefix='net-dev-cli-ssh-'))
     try:
         path = folder / 'ssh_config'
         path.write_text(ssh_config_text(config, batch), encoding='utf-8')
@@ -6516,8 +6815,10 @@ def check_tool_updates():
         print(f"This copy wasn't installed with git clone, so it can't update itself.\n"
               f"Get the latest version from {REPO_URL}")
         return
-    print(f"Checking {REPO_URL}...")
     try:
+        # The repo this clone actually fetches from, shown without any credentials in its URL
+        remote = re.sub(r'//[^/@]*@', '//', git('ls-remote', '--get-url').stdout.strip())
+        print(f"Checking {remote or 'the remote repo'}...")
         fetch = git('fetch', '--quiet')
         if fetch.returncode:
             print(f"Could not reach the repo: {fetch.stderr.strip()}")
@@ -6562,13 +6863,22 @@ def check_tool_updates():
 # ---------------------------------------------------------------- main
 
 def main():
+    """Returns the exit code."""
     global LOG
-    config = load_config()
-    LOG = start_log(config)
     try:
+        try:
+            config = load_config()
+        except ConfigLoadError as e:
+            print(f"\nThe tool can't start: {e}")
+            if FROZEN:
+                # Started by double-click, the window would close before the message could be read
+                ask("\nPress Enter to close this window.")
+            return 1
+        LOG = start_log(config)
         if config['verify_ssl'] is False:
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-            print("WARNING: verify_ssl is false - firewall certificates are not being checked.")
+            print(f"verify_ssl is false - certificates aren't checked against a CA. Each firewall's is trusted the "
+                  f"first time it connects, and has to match every time after ({CERTS_PATH.name}).")
         watch_console_close()
         while True:
             try:
@@ -6634,4 +6944,4 @@ if __name__ == '__main__':
     if ASKPASS_ENV in os.environ:
         # Started by ssh to answer a prompt during Connect via SSH - not a new run of the tool
         sys.exit(askpass_main(sys.argv[1:]))
-    main()
+    sys.exit(main())

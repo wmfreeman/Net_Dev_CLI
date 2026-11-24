@@ -13,8 +13,8 @@ Checks the PAN-OS version and dynamic content (Apps & Threats, Antivirus, WildFi
 ## Installation
 
 ```powershell
-git clone https://github.com/wmfreeman/palo-toolkit.git
-cd palo-toolkit
+git clone https://github.com/wmfreeman/Net_Dev_CLI.git
+cd Net_Dev_CLI
 poetry lock
 poetry install
 ```
@@ -33,14 +33,14 @@ The script runs `poetry install`, which includes PyInstaller as a dev dependency
 
 - **Running it:** copy the EXE anywhere and double-click it, or run it from a terminal. It's a console program, so it opens its own window when double-clicked.
 - **Config:** on first run it creates `config\config.yml` next to the EXE, from the skeleton bundled inside it, and `config\health_checks.yaml` the first time the health check thresholds are needed. Keep the EXE in a folder you can write to.
-- **Errors:** if the EXE stops with an unexpected error, it prints the error and waits for Enter, so the window doesn't close before you can read it.
+- **Errors:** if the EXE stops with an unexpected error, or can't read `config.yml` (a typo after editing it by hand, say), it prints why and waits for Enter, so the window doesn't close before you can read it.
 - **Updates:** the EXE can't update itself, so Check for Tool Updates says so. Build a new EXE from an updated clone instead.
 - **Start-up:** each run unpacks itself to a temporary folder first, so it takes a few seconds to start.
 - **Security tools:** they sometimes flag PyInstaller EXEs they haven't seen before. If yours blocks it, it may need allow-listing.
 
 `config/config.yml` is created from `config/skeleton_config.yml` on first run, and `config/health_checks.yaml` (the [health check thresholds](#health-check-thresholds)) from `config/skeleton_health_checks.yaml` the first time it's needed. Change them from [Settings](#settings) (Main Menu option 7), or by editing them. Set `default_target` to the firewalls you usually check (any form the Target prompt accepts), or leave it blank. Once the [local data file](#local-data-file) holds devices, those are the default instead.
 
-Certificate checking is off by default (`verify_ssl: false`) because firewall management interfaces use self-signed certificates. Set it to `true`, or to the path of a CA bundle, if yours are signed by a CA you trust.
+By default (`verify_ssl: false`) certificates aren't checked against a CA, because firewall management interfaces use self-signed certificates. Instead, each firewall's certificate is trusted the first time you connect to it and pinned: every connection after that has to present the same one, or nothing is sent (see [Certificates](#certificates)). Set `verify_ssl` to `true`, or to the path of a CA bundle, if your certificates are signed by a CA you trust.
 
 ## Usage
 
@@ -76,7 +76,7 @@ The Main Menu is the application level: connecting, the local data file, setting
 | 5 - Write Local Data File | Asks which data file to write (Enter takes the current one), then creates it or updates it with the device database (see [Local data file](#local-data-file)) |
 | 6 - View Devices | Lists the known devices, numbered. Only shown once the device database holds some: after loading a data file, or after connecting. |
 | 7 - Settings | Application Settings (every `config.yml` setting, by category, plus the JumpHosts for Connect via SSH) and Health Check Thresholds (`health_checks.yaml`). Each change is saved straight away (see [Settings](#settings)). |
-| 8 - Check for Tool Updates | Checks the repo it was cloned from ([GitHub](https://github.com/wmfreeman/palo-toolkit)) for a newer version of this tool (see below) |
+| 8 - Check for Tool Updates | Checks the repo it was cloned from ([GitHub](https://github.com/wmfreeman/Net_Dev_CLI)) for a newer version of this tool (see below) |
 | 0 - Exit | [Disconnects](#disconnect) any firewalls still connected, with the same report as option 3, then exits |
 
 **Staying connected.** After connecting, and after `0` in Palo Firewall Management, you're back here, still connected: the API keys, the password and the keep-alive carry on, and the [application idle timeout](#session-timeouts-and-the-keep-alive) still applies. Manage Devices opens Palo Firewall Management for them. Connect to Device(s) while connected adds firewalls to the session: they're numbered on from the ones already connected, only the new ones are authenticated (with their MFA pushes), and a firewall already connected isn't added twice (one that has lost its key is authenticated again). The authentication table is then shown for the whole session.
@@ -98,7 +98,7 @@ They're in hostname order (or IP, for a device with no hostname yet), so a devic
 
 **Check for Tool Updates** runs `git fetch` and lists any new commits on the branch you're on, with their dates. It then asks before applying them with `git pull --ff-only`. That only fast-forwards, so it never overwrites local edits or merges over local commits; if there are any, it says so and changes nothing. After an update, exit and start the tool again. If `pyproject.toml` or `poetry.lock` changed, run `poetry install` first.
 
-It uses your normal git credentials (Git Credential Manager on Windows) and never prompts in the terminal. It needs `git` on PATH, and a copy installed with `git clone`.
+It uses your normal git credentials (Git Credential Manager on Windows) and never prompts in the terminal. It needs `git` on PATH, and a copy installed with `git clone`. It names the repo it checks: the one your copy was cloned from. A copy cloned from the retired `palo-toolkit` repo gets no more updates; point it here once with `git remote set-url origin https://github.com/wmfreeman/Net_Dev_CLI.git`.
 
 ### Disconnect
 
@@ -107,6 +107,7 @@ Main Menu option 3, shown while firewalls are connected. Logs out of every conne
 - **The logout:** the keep-alive is stopped first, so no poll can log you back in. Then each firewall that holds a key gets `<delete><admin-sessions><username>{your username}</username></admin-sessions></delete>`, all at once. PAN-OS has no logout for a single API session, so the command targets every session that admin has on the firewall. In testing, a web UI session for the same admin stayed logged in.
 - **The report:** one row per firewall. `Logged out` means the firewall confirmed it, or ended the session the request arrived on. `FAIL` gives the reason (no reply, refused, no permission for the command), and that session then ends at the firewall's own admin idle timeout. A firewall whose session had already ended is listed with `-`. One that never authenticated isn't listed.
 - **The key is cleared either way**, whatever the firewall answers.
+- **The logout is optional:** `logout_on_disconnect` (Settings > Application Settings > Connection, default On). Because the logout ends every CLI and API session that admin has on the firewall, turn it Off if you share an admin account, or keep other SSH sessions open with the same account. Off, Disconnect only clears the keys and the password, each firewall is listed as `Key cleared`, and its session ends at the firewall's own idle timeout.
 
 The same Disconnect runs, with the same report, when you:
 
@@ -331,6 +332,8 @@ They also appear at the bottom of the action's results table as `SKIPPED` with t
 
 ### Authentication
 
+With `verify_ssl: false` (the default), each firewall's [certificate](#certificates) is checked first, before the tool asks for anything.
+
 1. The tool asks for your username and password once.
 2. For each selected firewall in turn, it generates an API key and then makes one call with it to confirm the key works. Approve each MFA push within `keygen_timeout` seconds.
 3. A firewall only passes once its key has been accepted. The stage prints PASS or FAIL as it goes, including how long the keygen and the first use took.
@@ -356,6 +359,16 @@ HA: 1 pair(s) in the list; peer not in the list for #4
 **HA Peer** shows the peer's number and hostname when it's in the list, with `(not authenticated)` if its login failed. A peer that isn't in the list is shown by the management IP its partner reports, with its hostname if the device database knows that serial number. **Notes** holds the reason a firewall failed, or what to check on one that passed. The model and PAN-OS version shown are as read at login. After [Retry Authentication](#9---retry-authentication), the table is shown again for the whole list, so retried peers pair up.
 
 Every MFA push happens in this stage, so listing, checking and later actions never stop to wait for one. On some setups, PAN-OS logs a remote (RADIUS) admin in again the first time a new key is used, which sends a second push. If it does and you ignore it, the firewall fails with "rejected on first use", and you can retry it with [Retry Authentication](#9---retry-authentication).
+
+#### Certificates
+
+Management interfaces use self-signed certificates, so with `verify_ssl: false` the tool can't check them against a CA. Instead it trusts each firewall's certificate the first time you connect to it, and pins it, the way ssh treats host keys:
+
+- **First connection:** before the password is asked for, each firewall the tool hasn't seen is listed with its certificate's SHA-256 fingerprint. One question trusts them all. Check a fingerprint against the one your browser shows for the firewall's web UI if you can. Trusted fingerprints are kept in `config\known_certs.txt`, one `<address>:<port> <sha256>` per line. If you answer no, those firewalls are `SKIPPED` and get nothing.
+- **Every connection after that** has to present the same certificate. This includes keep-alive polls, actions and Disconnect, directly or through a proxy. It's checked during the TLS handshake, before anything (the credentials included) is sent.
+- **A changed certificate is refused:** the firewall fails with `its certificate has CHANGED since it was trusted - possible interception, nothing sent`, and both fingerprints are shown. If it was replaced on purpose (a renewed certificate, or a replacement firewall at that address), delete its line in `known_certs.txt` and connect again.
+- **Not read:** a firewall whose certificate can't be read (no answer, refused) fails before anything is sent.
+- A firewall reached at a different address (its hostname instead of its IP, say) is a separate entry, trusted the first time too. With `verify_ssl: true` or a CA bundle, certificates are checked against the CA instead and nothing is pinned.
 
 #### Session timeouts and the keep-alive
 
@@ -502,14 +515,16 @@ Both install options then show a plan for each firewall and ask for a confirmati
 | Skip - up to date / already installed | Nothing to do |
 | Skip - update check failed | The check failed on that firewall, so there's no release list to install from |
 | Skip - this firewall does not list that version | Advanced Installation only |
+| Skip - the firewall didn't list a file name to download | The update check gave no file name for a version that isn't downloaded yet |
 
 The steps run on all the firewalls at once. Within one firewall they run in order (Apps & Threats before Antivirus, which needs a recent Apps & Threats version), and a failed step stops that firewall's later steps. Each download and install is a firewall job; the tool polls it every 10 seconds and prints its progress, up to `job_timeout` seconds (default 1800). A results table follows. Ctrl+C stops watching: jobs already started carry on on the firewall, and steps that hadn't started aren't sent.
 
 | Content | Download | Install |
 |---------|----------|---------|
-| Apps & Threats, Antivirus, WildFire (current) | `<download><latest></latest></download>` | `<install><version>latest</version></install>` |
-| Apps & Threats, Antivirus, WildFire (specific) | `<download><file>{filename}</file></download>` | `<install><version>{version}</version></install>` |
+| Apps & Threats, Antivirus, WildFire | `<download><file>{filename}</file></download>` | `<install><version>{version}</version></install>` |
 | GP Client | `<download><version>{version}</version></download>` | `<activate><version>{version}</version></activate>` |
+
+Both install options name the file and version the update check listed, never `latest`. A release published after the check (WildFire's come every few minutes) isn't picked up instead, so what's installed is what the plan showed, and what the results table and CSV say.
 
 With new apps disabled, Apps & Threats installs add the `<disable-new-content></disable-new-content>` flag inside `<install>`, before `<version>`. With new apps enabled, the flag is left out.
 
@@ -631,11 +646,11 @@ Checks need each firewall to have its own internet access to the Palo Alto updat
 
 Every option works on as many firewalls as you choose. Downloads go to `download_folder` from `config.yml` (default `%USERPROFILE%\Downloads`).
 
-**1 - Create Config Snapshot** saves a configuration snapshot on each firewall, named with today's date: `<YYYY-MM-DD>.xml`, the same as `save config to 2026-11-05.xml` in the CLI. The hostname isn't part of it, because the file stays on its own firewall; the hostname is added when it's downloaded. The tool shows the name and asks for a confirmation, then saves the snapshots and shows a results table. A snapshot holds the candidate configuration, so it includes any changes that aren't committed yet.
+**1 - Create Config Snapshot** saves a configuration snapshot on each firewall, named with the date and time: `<YYYY-MM-DD_HHMMSS>.xml`, the same as `save config to 2026-11-05_143012.xml` in the CLI. The time means a second snapshot on the same day (after a change, say) never replaces the first. The hostname isn't part of it, because the file stays on its own firewall; the hostname is added when it's downloaded. The tool shows the name and asks for a confirmation, then saves the snapshots and shows a results table. A snapshot holds the candidate configuration, so it includes any changes that aren't committed yet.
 
-**2 - Download Recent Config Snapshot** saves each firewall's most recent snapshot as `<hostname>_<snapshot name>`, e.g. `fw01_2026-11-05.xml`.
+**2 - Download Recent Config Snapshot** saves each firewall's most recent snapshot as `<hostname>_<snapshot name>`, e.g. `fw01_2026-11-05_143012.xml`.
 
-- **Which snapshot:** the newest `<YYYY-MM-DD>.xml` created by this tool. If the firewall has none, the name with the latest date in it, e.g. `pre-upgrade_2026-11-01.xml`, downloaded as `fw01_pre-upgrade_2026-11-01.xml`. Snapshots without a date in the name, such as `running-config.xml` and `snapshot.xml`, aren't considered. If the firewall's list can't be read, the snapshot created on that firewall in this session is used.
+- **Which snapshot:** the newest `<YYYY-MM-DD_HHMMSS>.xml` created by this tool (older versions saved `<YYYY-MM-DD>.xml`; those count too, by date). If the firewall has none, the name with the latest date in it, e.g. `pre-upgrade_2026-11-01.xml`, downloaded as `fw01_pre-upgrade_2026-11-01.xml`. Snapshots without a date in the name, such as `running-config.xml` and `snapshot.xml`, aren't considered. If the firewall's list can't be read, the snapshot created on that firewall in this session is used.
 - **File name:** the full hostname from `show system info` (or the target as you entered it, if the firewall reports none), with characters Windows doesn't allow in a file name replaced by `-`. Hostnames are unique, so files from different firewalls don't collide.
 - **Listing:** the list comes from the XML API's `complete` action on `show config saved` (the CLI's Tab completion).
 - **Download:** the file comes from `<show><config><saved>{name}</saved></config></show>`.
@@ -811,9 +826,9 @@ JumpHost - number [none]: 1
 - **Login.** ssh connects to the same address the API uses (without the HTTPS port), as the username you authenticated with. Approve the MFA push if your login sends one.
 - **JumpHosts.** The JumpHost question is only asked when some are set up (Settings > Application Settings > JumpHosts). For each session, the tool writes every JumpHost to a temporary ssh config file and runs `ssh -F <that file> -J <JumpHost> ...`. The file has no passwords and is deleted when the session ends. Your own `~/.ssh/config` is still read, after the JumpHosts. Anything a JumpHost asks for (its password, a key passphrase) you type.
 - **The password is filled in** for a firewall that accepted it at authentication. A firewall that rejected or skipped the login is never sent it, so it can't count towards an account lockout: ssh asks you to type it there.
-- **How it's filled in.** ssh only takes a password from a program, so it runs the tool's EXE a second time (`SSH_ASKPASS`). That copy fetches the password once over a local named pipe that only your account can open, protected by a random key for that session. It only does that for a prompt naming the firewall (`admin@10.0.1.7's password:`), so a JumpHost's prompts never get it. The password never goes on a command line, in an environment variable or on disk, and the pipe closes once it's been handed over: if ssh asks again (a wrong password, or an MFA code), you type it.
+- **How it's filled in.** ssh only takes a password from a program, so it runs the tool's EXE a second time (`SSH_ASKPASS`). That copy fetches the password once over a local named pipe that only your account can open, protected by a random key for that session. It only does that for a prompt that starts with the firewall's user@host, the way ssh writes them (`admin@10.0.1.7's password:` or `(admin@10.0.1.7) Password:`), so a JumpHost's prompts never get it, even one that mentions the firewall. The password never goes on a command line, in an environment variable or on disk, and the pipe closes once it's been handed over: if ssh asks again (a wrong password, or an MFA code), you type it.
 - **Host keys are checked as ssh always does**, against your own `known_hosts`, JumpHosts included. The first time you connect to a firewall, ssh shows its key fingerprint and asks whether to continue; check it before answering `yes`. The tool never turns that check off.
-- **Filling in needs the EXE and OpenSSH 8.4 or later** (Windows 11 has 9.5). Run from source, or with an older client, ssh asks for the password and everything else works the same.
+- **Filling in needs the EXE and OpenSSH 8.5 or later** (Windows 11 has 9.5). 8.5 is the first to start every keyboard-interactive prompt with `(user@host)`, which is how a JumpHost's prompt is told apart from the firewall's. Run from source, with an older client, or if the client's version can't be read, ssh asks for the password and everything else works the same.
 - While the session is open, the [application idle timeout](#session-timeouts-and-the-keep-alive) waits, the keep-alive carries on, and Ctrl+C goes to the firewall's CLI, not the tool. The run log records that the session started and ended, but not what happened in it.
 
 #### 9 - Retry Authentication
@@ -857,7 +872,7 @@ Antivirus and WildFire files aren't offered for deletion, because those use sepa
 - The password is read with `getpass`. Once a firewall accepts it, it's kept in memory for [Connect via SSH](#8---connect-via-ssh) until you [disconnect](#disconnect) (Disconnect, Exit, Ctrl+C, or the idle timeout). Going back to the Main Menu keeps it. If no firewall accepts it, it's dropped straight away. Retrying asks for it again.
 - Credentials go in the POST body, never in a URL.
 - API keys are held only in memory. Disconnect logs each one's admin session out on the firewall and clears them, and it also runs when you exit (including Ctrl+C and closing the window).
-- Nothing is written to disk except `config/config.yml` and `config.yml.bak`, which hold no secrets (JumpHosts name a key file, never a key or password), the temporary ssh config written for a JumpHost session (deleted when it ends), the [run logs](#run-logs), the [local data file](#local-data-file) when you write it (firewall details only, never credentials or keys), and the config snapshots and system state backups you download. Those downloads are the firewall's full configuration, including password hashes and encrypted keys, so keep them safe.
+- Nothing is written to disk except `config/config.yml` and `config.yml.bak`, which hold no secrets (JumpHosts name a key file, never a key or password), `config/known_certs.txt` (certificate fingerprints, no secrets), the temporary ssh config written for a JumpHost session (deleted when it ends), the [run logs](#run-logs), the [local data file](#local-data-file) when you write it (firewall details only, never credentials or keys), and the config snapshots and system state backups you download. Those downloads are the firewall's full configuration, including password hashes and encrypted keys, so keep them safe.
 - The run logs record the username and every answer you type, but never the password (it's read with `getpass`, which bypasses the log) or the API keys.
 
 ## Run logs
@@ -884,7 +899,7 @@ At start-up, logs and results files older than `log_retention_days` are deleted.
 | Option | Default | What it does |
 |--------|---------|--------------|
 | `default_target` | `''` | Offered at the Target prompt when no devices are known: one firewall, a list, or a file path |
-| `verify_ssl` | `false` | Certificate checking: `false`, `true`, or the path to a CA bundle |
+| `verify_ssl` | `false` | Certificate checking: `false` (each firewall's certificate trusted on first use and pinned in `known_certs.txt`, see [Certificates](#certificates)), `true`, or the path to a CA bundle |
 | `keygen_timeout` | `90` | Seconds to approve the MFA push |
 | `request_timeout` | `30` | Seconds to wait for any other API call, and for ssh to connect to a JumpHost |
 | `check_timeout` | `120` | Seconds to wait for an update check, a snapshot, a system state export, a log search or a JumpHost test |
@@ -892,6 +907,7 @@ At start-up, logs and results files older than `log_retention_days` are deleted.
 | `job_poll_interval` | `10` | Seconds between job status checks |
 | `keepalive_interval` | `60` | Seconds between keep-alive polls of every authenticated firewall; `0` turns polling off |
 | `app_idle_timeout` | `30` | Minutes with no activity before the tool disconnects (logs out and clears the keys) and returns to the Main Menu; `0` never disconnects |
+| `logout_on_disconnect` | `true` | Disconnect logs out of each firewall (`delete admin-sessions`, ending every CLI and API session that admin has there); `false` only clears the keys and the password (see [Disconnect](#disconnect)) |
 | `download_folder` | `%USERPROFILE%\Downloads` | Where snapshots, system state backups and log search CSVs are saved |
 | `log_folder` | `logs` | Where run logs are written |
 | `log_retention_days` | `30` | Logs older than this are deleted at start-up; `0` keeps them all |
@@ -940,13 +956,14 @@ The seconds shown next to each result help tell these apart. `Monitor > Logs > S
 ## Project Structure
 
 ```text
-palo-toolkit/
+Net_Dev_CLI/
 ├── config/
 │   ├── config.yml              # Your configuration (not in repo)
 │   ├── config.yml.bak          # The copy before the last Settings change (not in repo)
 │   ├── data_template.csv       # Empty data file with every column
 │   ├── health_checks.yaml      # Your health check thresholds (not in repo)
 │   ├── health_checks.yaml.bak  # The copy before the last threshold change (not in repo)
+│   ├── known_certs.txt         # Certificates trusted on first use, verify_ssl: false (not in repo)
 │   ├── skeleton_config.yml     # Configuration template
 │   └── skeleton_health_checks.yaml  # Health check thresholds template
 ├── data/

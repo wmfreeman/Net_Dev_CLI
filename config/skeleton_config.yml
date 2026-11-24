@@ -8,7 +8,8 @@
 #   a file:         C:\Users\me\firewalls.txt   (one firewall per line: IP, hostname, or IP,hostname)
 default_target: ''
 
-# false = skip the certificate check (self-signed management certificates) - prints a warning
+# false = no CA check (self-signed management certificates). Each firewall's certificate is
+#         trusted the first time it connects and has to match every time after (known_certs.txt)
 # true  = check each firewall's certificate against the system CA store
 # or the path to a CA bundle (.pem) that signed the management certificates
 verify_ssl: false
@@ -32,6 +33,12 @@ keepalive_interval: 60
 # disconnects (logs out of each firewall, clears the API keys) and returns to the Main Menu.
 # 0 never disconnects.
 app_idle_timeout: 30
+# true  = Disconnect (also Exit, Ctrl+C, the idle timeout, an error, closing the window) logs out of
+#         each firewall with delete admin-sessions. That ends every CLI and API session the admin has
+#         on it - your other SSH sessions too, and anyone else's on the same account.
+# false = the API keys and the password are only cleared from memory; each session ends at the
+#         firewall's own admin idle timeout
+logout_on_disconnect: true
 
 # Seconds between status checks while a download or install job runs (1-300)
 job_poll_interval: 10
