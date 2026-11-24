@@ -47,8 +47,10 @@ DEFAULT_PORT = 443
 # Connect via SSH (Palo Firewall Management option 8) uses Windows' built-in OpenSSH client
 SSH_CLIENT = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32' / 'OpenSSH' / 'ssh.exe'
 SSH_VERSION = re.compile(r'OpenSSH\w*?_(\d+)\.(\d+)')
-# SSH_ASKPASS_REQUIRE, which lets ssh take the password from this tool, arrived in OpenSSH 8.4
-SSH_ASKPASS_VERSION = (8, 4)
+# Filling in the password needs OpenSSH 8.5: SSH_ASKPASS_REQUIRE (8.4) lets ssh take it from this
+# tool, and 8.5 starts every keyboard-interactive prompt with '(user@host)', so a prompt a JumpHost
+# sends can't pass for the firewall's (prompt_names)
+SSH_ASKPASS_VERSION = (8, 5)
 # Set only in ssh's environment: tells this tool, started again by ssh to answer a prompt, where to
 # fetch the password (AskpassServer)
 ASKPASS_ENV = 'NET_DEV_CLI_ASKPASS'
@@ -5345,10 +5347,15 @@ def console_answer(prompt, echo):
 
 
 def prompt_names(prompt, target):
-    """Whether an ssh prompt is for target (['user@host'], from ASKPASS_ENV): the name has to be
-    followed by "'s password" or ")", so admin@10.1.0.2 doesn't match a prompt for admin@10.1.0.25."""
+    """Whether an ssh prompt is the firewall's own password prompt for target (['user@host'], from
+    ASKPASS_ENV). It has to start with target, the way ssh writes those prompts: "user@host's password: "
+    (a password login) or "(user@host) ..." (keyboard-interactive, OpenSSH 8.5+). A JumpHost can put any
+    text in its own keyboard-interactive prompt, but ssh starts that prompt with the JumpHost's
+    (user@host) - so a prompt that only mentions the firewall further on never gets the password. The
+    name has to be followed by "'s password" or ")", so admin@10.1.0.2 doesn't match admin@10.1.0.25."""
     target = target[0] if target else ''
-    return bool(target) and bool(re.search(re.escape(target) + r"(?=['\)])", prompt, re.IGNORECASE))
+    name = re.escape(target)
+    return bool(target) and bool(re.match(rf"(?:{name}'s password|\({name}\))", prompt, re.IGNORECASE))
 
 
 def askpass_main(args):
@@ -5391,9 +5398,12 @@ def ssh_fill_blocker(version):
     """Why the password can't be filled in for any firewall, or None if it can."""
     if not FROZEN:
         return "running from source, and ssh can only take a password from a program - the EXE fills it in"
-    if version and version < SSH_ASKPASS_VERSION:
-        return (f"this OpenSSH client ({version[0]}.{version[1]}) is older than 8.4, which can't take a "
-                f"password from the tool")
+    needed = '.'.join(map(str, SSH_ASKPASS_VERSION))
+    if not version:
+        return f"the OpenSSH client's version couldn't be read, and filling in needs {needed} or later"
+    if version < SSH_ASKPASS_VERSION:
+        return (f"this OpenSSH client ({version[0]}.{version[1]}) is older than {needed}, which the tool "
+                f"needs to fill in the password safely")
     return None
 
 
