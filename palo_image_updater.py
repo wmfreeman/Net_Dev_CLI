@@ -183,9 +183,10 @@ IMAGE_CORRUPT = re.compile(r'md5sum|checksums? did not match|authentication erro
 MANAGEMENT_LOST = re.compile(r'actively refused|response was not xml|remote end closed|connection aborted|'
                              r'lost track of job', re.IGNORECASE)
 
-# Config snapshots are saved on the firewall as <YYYY-MM-DD>.xml, and downloaded as
-# <hostname>_<snapshot name>
-SNAPSHOT_NAME = re.compile(r'^\d{4}-\d{2}-\d{2}\.xml$')
+# Config snapshots are saved on the firewall as <YYYY-MM-DD_HHMMSS>.xml - the time keeps a second
+# snapshot the same day from replacing the first - and downloaded as <hostname>_<snapshot name>.
+# Older versions of the tool saved <YYYY-MM-DD>.xml, which still counts as the tool's own.
+SNAPSHOT_NAME = re.compile(r'^\d{4}-\d{2}-\d{2}(?:_\d{6})?\.xml$')
 SNAPSHOT_DATE = re.compile(r'\d{4}-\d{2}-\d{2}')
 # Completion point for 'show config saved <name>', which lists the saved snapshots
 SAVED_CONFIGS_XPATH = '/operations/show/config/saved'
@@ -3915,14 +3916,15 @@ def device_name(fw):
     return file_safe(fw.hostname or fw.name)
 
 
-def snapshot_name(day):
-    """The name a snapshot is saved under on the firewall: '<YYYY-MM-DD>.xml'."""
-    return f"{day.isoformat()}.xml"
+def snapshot_name(moment):
+    """The name a snapshot is saved under on the firewall: '<YYYY-MM-DD_HHMMSS>.xml'."""
+    return f"{moment:%Y-%m-%d_%H%M%S}.xml"
 
 
 def newest_snapshot(names):
-    """The most recent snapshot: the latest <YYYY-MM-DD>.xml saved by this tool if there is one,
-    otherwise the name with the latest date in it. None if no name has a date."""
+    """The most recent snapshot: the latest <YYYY-MM-DD_HHMMSS>.xml (or older <YYYY-MM-DD>.xml) saved by
+    this tool if there is one - they sort by date, then time - otherwise the name with the latest date in
+    it. None if no name has a date."""
     own = [name for name in names if SNAPSHOT_NAME.match(name)]
     if own:
         return max(own)
@@ -3963,7 +3965,7 @@ def create_snapshots(firewalls):
     if not selected:
         return
     stage('Create Config Snapshot')
-    name = snapshot_name(datetime.date.today())
+    name = snapshot_name(datetime.datetime.now())
     print(f"Snapshot name on each firewall: {name}")
     print("A snapshot holds the candidate configuration, including any changes that aren't committed yet.")
     if not confirm(f"Save {name} on {len(selected)} firewall(s)?"):
