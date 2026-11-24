@@ -665,13 +665,28 @@ SETTINGS = {s.key: s for group in SETTING_CATEGORIES.values() for s in group}
 SETTINGS[JUMP_CHAINING.key] = JUMP_CHAINING
 
 
+class ConfigLoadError(Exception):
+    """config.yml can't be created or read, so the tool can't start. Says why, and what to do."""
+
+
 def load_config():
-    if not CONFIG_PATH.exists():
-        print(f"Config file not found - creating {CONFIG_PATH} from the skeleton.")
-        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(SKELETON_PATH, CONFIG_PATH)
-    with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f) or {}
+    """config.yml, every value checked (created from the skeleton the first time). Raises
+    ConfigLoadError if the file can't be created or read, or isn't YAML key: value settings."""
+    fix = (f"Fix it and start the tool again ({CONFIG_PATH.name}.bak, if there is one, is the copy before the "
+           f"last Settings change).")
+    try:
+        if not CONFIG_PATH.exists():
+            print(f"Config file not found - creating {CONFIG_PATH} from the skeleton.")
+            CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(SKELETON_PATH, CONFIG_PATH)
+        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+            config = yaml.safe_load(f) or {}
+    except yaml.YAMLError as e:
+        raise ConfigLoadError(f"{CONFIG_PATH} isn't valid YAML. {fix}\n{e}") from None
+    except (OSError, UnicodeDecodeError) as e:
+        raise ConfigLoadError(f"can't read {CONFIG_PATH}: {getattr(e, 'strerror', None) or e}") from None
+    if not isinstance(config, dict):
+        raise ConfigLoadError(f"{CONFIG_PATH} isn't a list of key: value settings. {fix}")
 
     # Older configs listed the firewalls under 'firewalls'
     old_list = [str(h).strip() for h in config.pop('firewalls', None) or [] if str(h).strip()]
@@ -1012,14 +1027,88 @@ ESC, DEL = 'esc', 'del'
 CANCEL = object()
 
 
+@contextlib.contextmanager
+def console_keys():
+    """The keys typed on the console, one at a time, for read_key_line: characters (Enter is '\\r' or
+    '\\n', Backspace '\\x08', Esc '\\x1b', Ctrl+C '\\x03'), DEL for the Delete key, and '' for other
+    special keys (arrows...). None if the console can't be read a key at a time.
+
+    Windows reads them with msvcrt. Elsewhere (macOS, Linux) the terminal is put in cbreak mode - no echo,
+    a key at a time, Ctrl+C still interrupts - and set back afterwards; Delete arrives as the escape
+    sequence ESC [ 3 ~, told apart from Esc pressed alone by whether more follows straight away."""
+    try:
+        import msvcrt
+    except ImportError:
+        msvcrt = None
+    if msvcrt:
+        def windows_keys():
+            while True:
+                ch = msvcrt.getwch()
+                if ch in '\x00\xe0':
+                    # A special key: Delete is 'S'; arrows and the rest are ignored
+                    yield DEL if msvcrt.getwch() == 'S' else ''
+                else:
+                    yield ch
+        yield windows_keys()
+        return
+    try:
+        import select
+        import termios
+        import tty
+    except ImportError:
+        yield None
+        return
+    try:
+        fd = sys.stdin.fileno()
+        saved = termios.tcgetattr(fd)
+        # TCSANOW: keys typed ahead of the prompt are kept
+        tty.setcbreak(fd, termios.TCSANOW)
+    except (OSError, ValueError, termios.error):
+        yield None
+        return
+    import codecs
+    decoder = codecs.getincrementaldecoder(sys.stdin.encoding or 'utf-8')(errors='replace')
+
+    def char():
+        while True:
+            data = os.read(fd, 1)
+            if not data:
+                raise EOFError
+            text = decoder.decode(data)
+            if text:
+                return text
+
+    def posix_keys():
+        while True:
+            ch = char()
+            if ch != '\x1b':
+                # Backspace sends DEL (\x7f) on most terminals
+                yield '\x08' if ch == '\x7f' else ch
+            elif not select.select([fd], [], [], 0.05)[0]:
+                yield ch   # Esc on its own
+            else:
+                # An escape sequence: ESC [ 3 ~ is Delete; the rest (arrows, Home, F keys...) are ignored
+                kind, sequence = char(), ''
+                if kind == '[':
+                    while not '@' <= (last := char()) <= '~':
+                        sequence += last
+                    sequence += last
+                elif kind == 'O':
+                    char()
+                yield DEL if (kind, sequence) == ('[', '3~') else ''
+    try:
+        yield posix_keys()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+
 def read_key_line(text):
     """Ask for a line on the console a key at a time, so Esc and Delete can be told apart from text.
     Returns (typed text, None) on Enter, (None, ESC) on Esc, or (None, DEL) on Delete. The prompt and
-    what's typed are shown, and logged, as with ask(). Without a console (input piped in) it reads an
-    ordinary line instead."""
+    what's typed are shown, and logged, as with ask(). Without a console (input piped in), or one that
+    can't be read a key at a time, it reads an ordinary line instead."""
     if not sys.stdin.isatty():
         return ask(text), None
-    import msvcrt
     # Echoed to the screen only; the finished line goes to the log once, at the end
     screen = sys.stdout.stream if isinstance(sys.stdout, _Tee) else sys.stdout
 
@@ -1027,32 +1116,33 @@ def read_key_line(text):
         screen.write(s)
         screen.flush()
 
-    show(text)
     chars, key, ending = [], None, ''
-    while True:
-        ch = msvcrt.getwch()
-        if ch in '\r\n':
-            break
-        if ch == '\x03':
-            show('\n')
-            raise KeyboardInterrupt
-        if ch == '\x1b':
-            key, ending = ESC, '  (Esc - cancelled)'
-            break
-        if ch in '\x00\xe0':
-            # A special key: Delete is 'S'; arrows and the rest are ignored
-            if msvcrt.getwch() == 'S':
+    with console_keys() as keys:
+        if keys is None:
+            return ask(text), None
+        show(text)
+        for ch in keys:
+            if not ch:
+                continue   # a special key that isn't used
+            if ch in ('\r', '\n'):
+                break
+            if ch == '\x03':
+                show('\n')
+                raise KeyboardInterrupt
+            if ch == '\x1b':
+                key, ending = ESC, '  (Esc - cancelled)'
+                break
+            if ch == DEL:
                 key, ending = DEL, '  (Del - default)'
                 break
-            continue
-        if ch == '\x08':
-            if chars:
-                chars.pop()
-                show('\b \b')
-            continue
-        if ch.isprintable():
-            chars.append(ch)
-            show(ch)
+            if ch == '\x08':
+                if chars:
+                    chars.pop()
+                    show('\b \b')
+                continue
+            if ch.isprintable():
+                chars.append(ch)
+                show(ch)
     show(ending + '\n')
     line = ''.join(chars)
     log_only(f"{text}{line}{ending}")
@@ -6773,10 +6863,18 @@ def check_tool_updates():
 # ---------------------------------------------------------------- main
 
 def main():
+    """Returns the exit code."""
     global LOG
-    config = load_config()
-    LOG = start_log(config)
     try:
+        try:
+            config = load_config()
+        except ConfigLoadError as e:
+            print(f"\nThe tool can't start: {e}")
+            if FROZEN:
+                # Started by double-click, the window would close before the message could be read
+                ask("\nPress Enter to close this window.")
+            return 1
+        LOG = start_log(config)
         if config['verify_ssl'] is False:
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
             print(f"verify_ssl is false - certificates aren't checked against a CA. Each firewall's is trusted the "
@@ -6846,4 +6944,4 @@ if __name__ == '__main__':
     if ASKPASS_ENV in os.environ:
         # Started by ssh to answer a prompt during Connect via SSH - not a new run of the tool
         sys.exit(askpass_main(sys.argv[1:]))
-    main()
+    sys.exit(main())

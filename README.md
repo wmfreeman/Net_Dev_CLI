@@ -33,7 +33,7 @@ The script runs `poetry install`, which includes PyInstaller as a dev dependency
 
 - **Running it:** copy the EXE anywhere and double-click it, or run it from a terminal. It's a console program, so it opens its own window when double-clicked.
 - **Config:** on first run it creates `config\config.yml` next to the EXE, from the skeleton bundled inside it, and `config\health_checks.yaml` the first time the health check thresholds are needed. Keep the EXE in a folder you can write to.
-- **Errors:** if the EXE stops with an unexpected error, it prints the error and waits for Enter, so the window doesn't close before you can read it.
+- **Errors:** if the EXE stops with an unexpected error, or can't read `config.yml` (a typo after editing it by hand, say), it prints why and waits for Enter, so the window doesn't close before you can read it.
 - **Updates:** the EXE can't update itself, so Check for Tool Updates says so. Build a new EXE from an updated clone instead.
 - **Start-up:** each run unpacks itself to a temporary folder first, so it takes a few seconds to start.
 - **Security tools:** they sometimes flag PyInstaller EXEs they haven't seen before. If yours blocks it, it may need allow-listing.
